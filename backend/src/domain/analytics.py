@@ -1,3 +1,4 @@
+# src/domain/analytics.py
 import asyncio
 import os
 import json
@@ -6,13 +7,14 @@ from collections import defaultdict
 from typing import List, Dict, Set, Optional
 from dotenv import load_dotenv
 import aiohttp
-from gidgetlab.aiohttp import GitLabAPI
 from src.domain.user_mapper import UserMapper
 
 load_dotenv()
 
 
 class GitLabAnalyticsComplete:
+    """Аналитика для одного проекта GitLab"""
+    
     def __init__(self, project_id: Optional[int] = None):
         """
         Args:
@@ -22,43 +24,88 @@ class GitLabAnalyticsComplete:
         self.url = os.getenv("GITLAB_URL", "https://gitlab.com").strip()
         self.user_mapper = UserMapper()
         
-        # Если project_id не передан, берём из env (для обратной совместимости)
         if project_id is not None:
             self.project_id = str(project_id)
         else:
             self.project_id = os.getenv("GITLAB_PROJECT_ID", "").strip() or None
+
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """Возвращает заголовки авторизации для GitLab API"""
+        return {
+            "PRIVATE-TOKEN": self.token,
+            "User-Agent": "TeamPerformanceHub/1.0",
+            "Content-Type": "application/json"
+        }
+
+    async def _gitlab_get(self, session: aiohttp.ClientSession, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
+        """Универсальный метод для GET-запросов к GitLab API"""
+        url = f"{self.url}/api/v4{endpoint}"
+        headers = self._get_auth_headers()
+        
+        try:
+            async with session.get(url, headers=headers, params=params) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status == 404:
+                    print(f"[WARN] 404: {endpoint}")
+                    return None
+                else:
+                    error_text = await response.text()
+                    print(f"[ERROR] {response.status} при запросе {endpoint}: {error_text[:200]}")
+                    return None
+        except Exception as e:
+            print(f"[ERROR] Сетевая ошибка при запросе {endpoint}: {type(e).__name__}: {e}")
+            return None
+
+    async def _gitlab_get_paginated(self, session: aiohttp.ClientSession, endpoint: str, params: Optional[Dict] = None) -> List[Dict]:
+        """Получает все страницы пагинированного ответа"""
+        items = []
+        page = 1
+        per_page = 100
+        
+        while True:
+            current_params = {**(params or {}), "page": page, "per_page": per_page}
+            data = await self._gitlab_get(session, endpoint, current_params)
+            
+            if not data:
+                break
+            
+            if isinstance(data, list):
+                if not data:
+                    break
+                items.extend(data)
+                page += 1
+            else:
+                items.append(data)
+                break
+                
+        return items
 
     async def get_project_info(self) -> Dict:
         if not self.project_id:
             return {"name": "All Projects"}
         
         async with aiohttp.ClientSession() as session:
-            gl = GitLabAPI(session, self.token, url=self.url)
-            try:
-                return await gl.getitem(f"/projects/{self.project_id}")
-            except Exception as e:
-                print(f"[ERROR] Ошибка получения информации о проекте: {e}")
-                return {}
+            data = await self._gitlab_get(session, f"/projects/{self.project_id}")
+            return data or {}
 
     async def get_all_branches(self) -> List[Dict]:
         if not self.project_id:
             return []
         
+        branches = []
         async with aiohttp.ClientSession() as session:
-            gl = GitLabAPI(session, self.token, url=self.url)
-            branches = []
-            try:
-                async for branch in gl.getiter(f"/projects/{self.project_id}/repository/branches"):
-                    branches.append({
-                        'name': branch['name'],
-                        'commit': branch['commit']['short_id'],
-                        'commit_date': branch['commit']['created_at'],
-                        'protected': branch.get('protected', False),
-                        'default': branch.get('default', False)
-                    })
-            except Exception as e:
-                print(f"[ERROR] Ошибка получения веток: {e}")
-            return branches
+            data = await self._gitlab_get_paginated(session, f"/projects/{self.project_id}/repository/branches")
+            
+            for branch in data:
+                branches.append({
+                    'name': branch['name'],
+                    'commit': branch['commit']['short_id'],
+                    'commit_date': branch['commit'].get('created_at'),
+                    'protected': branch.get('protected', False),
+                    'default': branch.get('default', False)
+                })
+        return branches
 
     async def get_commits_for_branch(self, branch_name: str, days: int = 90, seen_ids: Set[str] = None) -> List[Dict]:
         """Получает коммиты для ветки, исключая уже обработанные"""
@@ -68,40 +115,38 @@ class GitLabAnalyticsComplete:
         if seen_ids is None:
             seen_ids = set()
             
+        commits = []
+        since_date = (datetime.now() - timedelta(days=days)).isoformat()
+        params = {"ref_name": branch_name, "since": since_date}
+        
         async with aiohttp.ClientSession() as session:
-            gl = GitLabAPI(session, self.token, url=self.url)
-            since_date = (datetime.now() - timedelta(days=days)).isoformat()
-            params = {"ref_name": branch_name, "since": since_date, "per_page": 100}
-            commits = []
-            try:
-                async for commit in gl.getiter(f"/projects/{self.project_id}/repository/commits", params=params):
-                    if commit['id'] in seen_ids:
-                        continue
-                    seen_ids.add(commit['id'])
-                    
-                    try:
-                        detail = await gl.getitem(f"/projects/{self.project_id}/repository/commits/{commit['id']}")
-                        commit_date = datetime.fromisoformat(commit['created_at'].replace('Z', '+00:00'))
-                        commits.append({
-                            'id': commit['id'],
-                            'short_id': commit['short_id'],
-                            'title': commit['title'],
-                            'message': commit['message'],
-                            'author_name': self.user_mapper.normalize_author(commit['author_name']),
-                            'author_email': commit['author_email'],
-                            'created_at': commit['created_at'],
-                            'date': commit_date,
-                            'hour': commit_date.hour,
-                            'weekday': commit_date.weekday(),
-                            'additions': detail.get('stats', {}).get('additions', 0),
-                            'deletions': detail.get('stats', {}).get('deletions', 0),
-                            'total_changes': detail.get('stats', {}).get('total', 0)
-                        })
-                    except Exception as e:
-                        print(f"   [WARN] Не удалось получить статистику для {commit['short_id']}: {e}")
-            except Exception as e:
-                print(f"   [ERROR] Ошибка получения коммитов для ветки {branch_name}: {e}")
-            return commits
+            commits_data = await self._gitlab_get_paginated(session, f"/projects/{self.project_id}/repository/commits", params)
+            
+            for commit in commits_data:
+                if commit['id'] in seen_ids:
+                    continue
+                seen_ids.add(commit['id'])
+
+                detail = await self._gitlab_get(session, f"/projects/{self.project_id}/repository/commits/{commit['id']}")
+                stats = detail.get('stats', {}) if detail else {}
+                
+                commit_date = datetime.fromisoformat(commit['created_at'].replace('Z', '+00:00'))
+                commits.append({
+                    'id': commit['id'],
+                    'short_id': commit['short_id'],
+                    'title': commit['title'],
+                    'message': commit['message'],
+                    'author_name': self.user_mapper.normalize_author(commit['author_name']),
+                    'author_email': commit['author_email'],
+                    'created_at': commit['created_at'],
+                    'date': commit_date,
+                    'hour': commit_date.hour,
+                    'weekday': commit_date.weekday(),
+                    'additions': stats.get('additions', 0),
+                    'deletions': stats.get('deletions', 0),
+                    'total_changes': stats.get('total', 0)
+                })
+        return commits
 
     def get_commit_activity_stats(self, commits: List[Dict]) -> Dict:
         if not commits:
@@ -143,14 +188,13 @@ class GitLabAnalyticsComplete:
             stats['commits_by_date'][date_str] += 1
             stats['authors'][author]['activity_by_date'][date_str] += 1
 
-           
         stats['authors'] = {k: {
-        'commits': v['commits'],
-        'additions': v['additions'],
-        'deletions': v['deletions'],
-        'activity_by_date': dict(v['activity_by_date']),
-        'commit_messages': stats['commit_messages'].get(k, []) 
-    } for k, v in stats['authors'].items()}
+            'commits': v['commits'],
+            'additions': v['additions'],
+            'deletions': v['deletions'],
+            'activity_by_date': dict(v['activity_by_date']),
+            'commit_messages': stats['commit_messages'].get(k, []) 
+        } for k, v in stats['authors'].items()}
         
         stats['commits_by_hour'] = dict(stats['commits_by_hour'])
         stats['commits_by_weekday'] = dict(stats['commits_by_weekday'])
@@ -169,50 +213,35 @@ class GitLabAnalyticsComplete:
             return []
         
         comments = []
-        url = f"{self.url}/api/v4/projects/{self.project_id}/merge_requests/{mr_iid}/discussions"
-        headers = {"Authorization": f"Bearer {self.token}", "User-Agent": "TeamPerformanceHub/1.0"}
+        endpoint = f"/projects/{self.project_id}/merge_requests/{mr_iid}/discussions"
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                page = 1
-                while True:
-                    params = {"per_page": 100, "page": page}
-                    async with session.get(url, headers=headers, params=params) as response:
-                        if response.status != 200:
-                            print(f"   [WARN] Ошибка {response.status} при получении комментариев MR !{mr_iid}")
-                            break
-                        discussions = await response.json()
-                        if not discussions:
-                            break
-                        for discussion in discussions:
-                            for note in discussion.get('notes', []):
-                                if note.get('system', False):
-                                    continue
-                                comment = {
-                                    'id': note['id'],
-                                    'author': self.user_mapper.normalize_author(note['author']['name']),
-                                    'author_username': note['author']['username'],
-                                    'created_at': note['created_at'],
-                                    'body': note['body'],
-                                    'type': self._classify_comment(note['body']),
-                                    'is_reply': note.get('type') == 'DiscussionNote',
-                                    'discussion_id': discussion.get('id')
-                                }
-                                if note.get('position'):
-                                    pos = note['position']
-                                    comment['file_path'] = pos.get('new_path') or pos.get('old_path')
-                                    comment['line'] = pos.get('new_line') or pos.get('old_line')
-                                comments.append(comment)
-                    link_header = response.headers.get('Link', '')
-                    if 'rel="next"' not in link_header:
-                        break
-                    page += 1
-        except Exception as e:
-            print(f"   [ERROR] Сетевая ошибка при получении комментариев MR !{mr_iid}: {e}")
+        async with aiohttp.ClientSession() as session:
+            discussions = await self._gitlab_get_paginated(session, endpoint)
+            
+            for discussion in discussions:
+                for note in discussion.get('notes', []):
+                    if note.get('system', False):
+                        continue
+                    comment = {
+                        'id': note['id'],
+                        'author': self.user_mapper.normalize_author(note['author']['name']),
+                        'author_username': note['author']['username'],
+                        'created_at': note['created_at'],
+                        'body': note['body'],
+                        'type': self._classify_comment(note['body']),
+                        'is_reply': note.get('type') == 'DiscussionNote',
+                        'discussion_id': discussion.get('id')
+                    }
+                    if note.get('position'):
+                        pos = note['position']
+                        comment['file_path'] = pos.get('new_path') or pos.get('old_path')
+                        comment['line'] = pos.get('new_line') or pos.get('old_line')
+                    comments.append(comment)
+                    
         return comments
 
     def _classify_comment(self, comment_body: str) -> str:
-        body_lower = comment_body.lower()
+        body_lower = (comment_body or "").lower()
         if any(k in body_lower for k in ['lgtm', 'approve', 'good', 'одобряю', 'отлично']):
             return 'approval'
         if any(k in body_lower for k in ['архитектура', 'дизайн', 'паттерн', 'architecture']):
@@ -227,14 +256,18 @@ class GitLabAnalyticsComplete:
             return 'question'
         return 'other'
 
-    async def _get_mr_commits(self, gl, mr_iid: int) -> List[Dict]:
-        """Получает коммиты MR с информацией об авторах"""
+    async def _get_mr_commits(self, mr_iid: int) -> List[Dict]:
+        """Получает коммиты для конкретного MR"""
         if not self.project_id:
             return []
         
         commits = []
-        try:
-            async for commit in gl.getiter(f"/projects/{self.project_id}/merge_requests/{mr_iid}/commits"):
+        endpoint = f"/projects/{self.project_id}/merge_requests/{mr_iid}/commits"
+        
+        async with aiohttp.ClientSession() as session:
+            commits_data = await self._gitlab_get_paginated(session, endpoint)
+            
+            for commit in commits_data:
                 commits.append({
                     'id': commit['id'],
                     'created_at': commit['created_at'],
@@ -242,124 +275,114 @@ class GitLabAnalyticsComplete:
                     'author_name': commit.get('author_name', ''),
                     'author_email': commit.get('author_email', '')
                 })
-        except Exception as e:
-            print(f"   [WARN] Ошибка получения коммитов MR !{mr_iid}: {e}")
         return commits
 
     async def get_merge_requests_detailed(self, days: int = 90) -> List[Dict]:
         if not self.project_id:
             return []
         
+        since_date = (datetime.now() - timedelta(days=days)).isoformat()
+        merge_requests = []
+        
         async with aiohttp.ClientSession() as session:
-            gl = GitLabAPI(session, self.token, url=self.url)
-            since_date = (datetime.now() - timedelta(days=days)).isoformat()
-            merge_requests = []
-            
             for state in ['opened', 'merged', 'closed']:
                 params = {
                     "state": state,
-                    "per_page": 100,
                     "created_after": since_date,
                     "order_by": "updated_at",
                     "sort": "desc"
                 }
-                try:
-                    async for mr in gl.getiter(f"/projects/{self.project_id}/merge_requests", params=params):
-                        created_at = datetime.fromisoformat(mr['created_at'].replace('Z', '+00:00'))
-                        comments = await self.get_merge_request_comments(mr['iid'])
-                        commits = await self._get_mr_commits(gl, mr['iid'])
-                        comment_stats = self._calculate_comment_stats(comments, created_at)
+                
+                mrs = await self._gitlab_get_paginated(session, f"/projects/{self.project_id}/merge_requests", params)
+                
+                for mr in mrs:
+                    created_at = datetime.fromisoformat(mr['created_at'].replace('Z', '+00:00'))
+                    
+                    comments, commits = await asyncio.gather(
+                        self.get_merge_request_comments(mr['iid']),
+                        self._get_mr_commits(mr['iid'])
+                    )
+                    
+                    comment_stats = self._calculate_comment_stats(comments, created_at)
 
-                        total_additions, total_deletions = 0, 0
-                        for c in commits:
-                            try:
-                                c_detail = await gl.getitem(f"/projects/{self.project_id}/repository/commits/{c['id']}")
-                                s = c_detail.get('stats', {})
-                                total_additions += s.get('additions', 0)
-                                total_deletions += s.get('deletions', 0)
-                            except Exception:
-                                pass
+                    total_additions, total_deletions = 0, 0
+                    for c in commits:
+                        detail = await self._gitlab_get(session, f"/projects/{self.project_id}/repository/commits/{c['id']}")
+                        if detail:
+                            s = detail.get('stats', {})
+                            total_additions += s.get('additions', 0)
+                            total_deletions += s.get('deletions', 0)
 
-                        commit_authors = set()
+                    commit_authors = set(c['author_name'] for c in commits if c.get('author_name'))
+                    if commit_authors:
+                        real_author = next(iter(commit_authors))
+                        real_author = self.user_mapper.normalize_author(real_author)
+                        real_author_username = None
                         for commit in commits:
-                            if commit.get('author_name'):
-                                commit_authors.add(commit['author_name'])
-                        
-                        # Кто делал коммиты
-                        if commit_authors:
-                            real_author = next(iter(commit_authors))
-                            real_author = self.user_mapper.normalize_author(real_author)
-                            real_author_username = None
-                            for commit in commits:
-                                if self.user_mapper.normalize_author(commit.get('author_name', '')) == real_author:
-                                    email = commit.get('author_email', '')
-                                    if email:
-                                        real_author_username = email.split('@')[0]
-                                    break
-                            if not real_author_username:
-                                real_author_username = real_author.lower().replace(' ', '.')
-                        else:
-                            # Если нет коммитов, используем автора MR
-                            real_author = self.user_mapper.normalize_author(mr['author']['name'])
-                            real_author_username = mr['author']['username']
-                        
-                        # Информация о том, кто смержил
-                        merged_by = None
-                        merged_by_username = None
-                        if mr.get('merged_by'):
-                            merged_by = mr['merged_by'].get('name')
-                            merged_by_username = mr['merged_by'].get('username')
-                        elif mr.get('merge_user'):
-                            merged_by = mr['merge_user'].get('name')
-                            merged_by_username = mr['merge_user'].get('username')
-                        
-                        total_changes = total_additions + total_deletions
-                        mr_quality = self._calculate_mr_quality_score(
-                            mr, commits, comments, total_changes, total_additions, total_deletions
-                        )
-                        
-                        mr_data = {
-                            'iid': mr['iid'],
-                            'title': mr['title'],
-                            'description': mr.get('description', ''),
-                            'author': self.user_mapper.normalize_author(mr['author']['name']),
-                            'author_username': mr['author']['username'],
-                            'actual_author': real_author,
-                            'actual_author_username': real_author_username,
-                            'merged_by': merged_by,
-                            'merged_by_username': merged_by_username,
-                            'created_at': mr['created_at'],
-                            'merged_at': mr.get('merged_at'),
-                            'state': state,
-                            'source_branch': mr['source_branch'],
-                            'target_branch': mr['target_branch'],
-                            'web_url': mr['web_url'],
-                            'changes_count': mr.get('changes_count', 0),
-                            'total_additions': total_additions,
-                            'total_deletions': total_deletions,
-                            'total_changes': total_changes,
-                            'commits_count': len(commits),
-                            'comments': comments,
-                            'comment_stats': comment_stats,
-                            'quality_score': mr_quality,
-                            'iterations': self._count_iterations(commits, created_at),
-                            'total_lines_changed': total_changes,
-                            'additions': total_additions,
-                            'deletions': total_deletions
-                        }
-                        
-                        if state == 'merged' and mr.get('merged_at'):
-                            merged_at = datetime.fromisoformat(mr['merged_at'].replace('Z', '+00:00'))
-                            mr_data['time_to_merge_hours'] = (merged_at - created_at).total_seconds() / 3600
-                        else:
-                            mr_data['time_to_merge_hours'] = None
-                        
-                        merge_requests.append(mr_data)
-                              
-                except Exception as e:
-                    print(f"[ERROR] Ошибка получения MR со статусом {state}: {e}")
-            
-            return merge_requests
+                            if self.user_mapper.normalize_author(commit.get('author_name', '')) == real_author:
+                                email = commit.get('author_email', '')
+                                if email:
+                                    real_author_username = email.split('@')[0]
+                                break
+                        if not real_author_username:
+                            real_author_username = real_author.lower().replace(' ', '.')
+                    else:
+                        real_author = self.user_mapper.normalize_author(mr['author']['name'])
+                        real_author_username = mr['author']['username']
+
+                    merged_by = None
+                    merged_by_username = None
+                    if mr.get('merged_by'):
+                        merged_by = mr['merged_by'].get('name')
+                        merged_by_username = mr['merged_by'].get('username')
+                    elif mr.get('merge_user'):
+                        merged_by = mr['merge_user'].get('name')
+                        merged_by_username = mr['merge_user'].get('username')
+                    
+                    total_changes = total_additions + total_deletions
+                    mr_quality = self._calculate_mr_quality_score(
+                        mr, commits, comments, total_changes, total_additions, total_deletions
+                    )
+                    
+                    mr_data = {
+                        'iid': mr['iid'],
+                        'title': mr['title'],
+                        'description': mr.get('description', ''),
+                        'author': self.user_mapper.normalize_author(mr['author']['name']),
+                        'author_username': mr['author']['username'],
+                        'actual_author': real_author,
+                        'actual_author_username': real_author_username,
+                        'merged_by': merged_by,
+                        'merged_by_username': merged_by_username,
+                        'created_at': mr['created_at'],
+                        'merged_at': mr.get('merged_at'),
+                        'state': state,
+                        'source_branch': mr['source_branch'],
+                        'target_branch': mr['target_branch'],
+                        'web_url': mr['web_url'],
+                        'changes_count': mr.get('changes_count', 0),
+                        'total_additions': total_additions,
+                        'total_deletions': total_deletions,
+                        'total_changes': total_changes,
+                        'commits_count': len(commits),
+                        'comments': comments,
+                        'comment_stats': comment_stats,
+                        'quality_score': mr_quality,
+                        'iterations': self._count_iterations(commits, created_at),
+                        'total_lines_changed': total_changes,
+                        'additions': total_additions,
+                        'deletions': total_deletions
+                    }
+                    
+                    if state == 'merged' and mr.get('merged_at'):
+                        merged_at = datetime.fromisoformat(mr['merged_at'].replace('Z', '+00:00'))
+                        mr_data['time_to_merge_hours'] = (merged_at - created_at).total_seconds() / 3600
+                    else:
+                        mr_data['time_to_merge_hours'] = None
+                    
+                    merge_requests.append(mr_data)
+        
+        return merge_requests
 
     def _calculate_comment_stats(self, comments: List[Dict], created_at: datetime) -> Dict:
         if not comments:
@@ -390,13 +413,12 @@ class GitLabAnalyticsComplete:
         print(f"[DEBUG] Delay hours: {delay_hours}")
         print(f"[DEBUG] Comments count: {len(comments)}")
     
-        
         return {
             'total': len(comments),
             'by_type': dict(by_type),
             'by_author': dict(by_author),
             'participants': list(participants),
-            'first_comment_delay_hours': round((first_time - created_at).total_seconds() / 3600, 1),
+            'first_comment_delay_hours': delay_hours,
             'reviewers_count': len(participants)
         }
 
@@ -422,7 +444,6 @@ class GitLabAnalyticsComplete:
             datetime.fromisoformat(mr['created_at'].replace('Z', '+00:00'))
         )
         comments_count = len(comments)
-
         size_value = lines_changed if lines_changed > 0 else mr.get('changes_count', 0)
         
         return {
@@ -434,10 +455,10 @@ class GitLabAnalyticsComplete:
                 "quick_first_review": None  
             },
             "details": {
-                "size": lines_changed if lines_changed > 0 else mr.get('changes_count', 0),
+                "size": size_value,
                 "additions": additions, 
                 "deletions": deletions,   
-                "changes_count": lines_changed if lines_changed > 0 else mr.get('changes_count', 0),
+                "changes_count": size_value,
                 "description_length": len(description),
                 "description_preview": (description[:100] + "...") if len(description) > 100 else description,
                 "iterations": iterations,
@@ -474,11 +495,13 @@ class GitLabAnalyticsComplete:
         commit_stats = self.get_commit_activity_stats(all_commits)
         print(f"[DEBUG] GitLabAnalyticsComplete: commit_messages keys = {list(commit_stats.get('commit_messages', {}).keys())}")
         
+        project_info = await self.get_project_info()
+        
         return {
             'project_id': int(self.project_id),
             'period_days': days,
             'generated_at': datetime.now().isoformat(),
-            'project_name': (await self.get_project_info()).get('name', 'Unknown'),
+            'project_name': project_info.get('name', 'Unknown'),
             'total_branches': len(branches),
             'commits': {
                 'total': len(all_commits),
@@ -578,13 +601,11 @@ class MultiProjectAnalytics:
             'projects': set(),
             'activity_by_date': defaultdict(int),
             'commit_messages': [] 
-
         })
         all_commits_by_date = defaultdict(int)
         all_mrs = []
         project_reports = {}
         
-        # Параллельно собираем данные по проектам
         tasks = []
         for pid in self.project_ids:
             analytics = GitLabAnalyticsComplete(project_id=pid)
@@ -603,13 +624,13 @@ class MultiProjectAnalytics:
                 'mrs_total': len(result['merge_requests']['list']),
             }
             
-            # Агрегируем коммиты по авторам
             for author, stats in result['commits']['by_author'].items():
                 normalized = self.user_mapper.normalize_author(author)
                 print(f"[DEBUG MULTI] Проект {pid}: автор '{author}' -> '{normalized}'")
                 print(f"[DEBUG MULTI]   commits: {stats.get('commits', 0)}")
                 print(f"[DEBUG MULTI]   commit_messages count: {len(stats.get('commit_messages', []))}")
                 print(f"[DEBUG MULTI]   commit_messages: {stats.get('commit_messages', [])[:2]}")
+                
                 all_commits_by_author[normalized]['commits'] += stats.get('commits', 0)
                 all_commits_by_author[normalized]['additions'] += stats.get('additions', 0)
                 all_commits_by_author[normalized]['deletions'] += stats.get('deletions', 0)
@@ -624,14 +645,12 @@ class MultiProjectAnalytics:
             if result['commits'].get('activity_by_date'):
                 for date, count in result['commits']['activity_by_date'].items():
                     all_commits_by_date[date] += count
-            
-            # Добавляем project_id к каждому MR
+
             for mr in result['merge_requests']['list']:
                 mr['project_id'] = pid
                 mr['project_name'] = result.get('project_name', 'Unknown')
                 all_mrs.append(mr)
         
-        # Конвертируем set в list для JSON
         for author_data in all_commits_by_author.values():
             author_data['projects'] = list(author_data['projects'])
             author_data['activity_by_date'] = dict(author_data['activity_by_date'])
@@ -661,4 +680,3 @@ class MultiProjectAnalytics:
         self, analytics: GitLabAnalyticsComplete, project_id: int, days: int
     ) -> Dict:
         return await analytics.generate_full_report(days=days)
-

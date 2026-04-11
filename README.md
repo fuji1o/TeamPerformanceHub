@@ -1,5 +1,5 @@
 ## УСТАНОВКА И ЗАПУСК
-
+версия python 3.11+ 
 ## Клонирование репозитория
 git clone https://github.com/fuji1o/TeamPerformanceHub.git
 cd TeamPerformanceHub
