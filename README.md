@@ -73,19 +73,19 @@ GITLAB_PROJECT_IDS=80386581,81167879
 
 ## НАСТРОЙКА МАППИНГА ПОЛЬЗОВАТЕЛЕЙ
 
-Если один разработчик в GitLab фигурирует под разными именами (например, Olesya Shiryaeva в коммитах и Liccva в MR), их нужно объединить.
+Если один разработчик в GitLab фигурирует под разными именами (например, Olesya в коммитах и Liccva в MR), их нужно объединить.
 
 Создайте файл author_mapping.json в папке backend:
 
 {
   "aliases": {
-    "Olesya Shiryaeva": "Liccva"
+    "Olesya": "Liccva"
   },
   "primary_names": {
     "Liccva": {
-      "display_name": "Olesya Shiryaeva",
+      "display_name": "Olesya",
       "username": "Liccva",
-      "emails": ["olesya.shiryaeva@*"]
+      "emails": ["olesya@*"]
     },
     "fuji1o": {
       "display_name": "fuji1o",
