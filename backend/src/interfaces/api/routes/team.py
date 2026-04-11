@@ -14,7 +14,6 @@ from . import _helpers
 
 router = APIRouter(tags=["team"])
 
-# Инициализация
 user_mapper = UserMapper()
 project_manager = ProjectManager()
 
