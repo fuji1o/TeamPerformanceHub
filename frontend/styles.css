@@ -74,7 +74,7 @@ a:hover{text-decoration:underline}
 }
 .logo h1{font-size:1.15rem;font-weight:700;letter-spacing:-.02em}
 
-.controls{display:flex;gap:.75rem;align-items:flex-end}
+.controls{display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap}
 .select-wrap{display:flex;flex-direction:column;gap:.2rem}
 .select-wrap label{font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text2);font-weight:600}
 .select-wrap select{
@@ -91,6 +91,12 @@ a:hover{text-decoration:underline}
 }
 .select-wrap select:hover{border-color:var(--accent)}
 .select-wrap select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+
+/* Скрытие селектора разработчика в режиме обзора */
+.select-wrap.hidden,
+#developerSelectWrap.hidden {
+  display: none !important;
+}
 
 /* ══════════════════════════════════════════
    EMPTY STATE
@@ -201,30 +207,212 @@ a:hover{text-decoration:underline}
   grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
   gap:.75rem;
 }
-.signal-card{
-  background:var(--surface);
-  border:1px solid var(--border);
-  border-radius:var(--radius);
-  padding:1.15rem 1.25rem;
-  display:flex;flex-direction:column;gap:.65rem;
-  transition:transform var(--transition),box-shadow var(--transition);
+/* ══════════════════════════════════════════
+   СИГНАЛЫ — НОВЫЙ СТИЛЬ
+   ══════════════════════════════════════════ */
+.signal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    transition: transform var(--transition), box-shadow var(--transition);
 }
-.signal-card:hover{transform:translateY(-2px);box-shadow:var(--shadow)}
 
-.signal-top{display:flex;justify-content:space-between;align-items:center}
-.signal-title{font-size:.88rem;font-weight:600}
-.signal-badge{
-  display:inline-flex;align-items:center;gap:.3rem;
-  padding:.25rem .7rem;border-radius:999px;
-  font-size:.78rem;font-weight:700;
-  white-space:nowrap;
+.signal-card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow);
 }
-.signal-badge[data-status="good"]   {background:var(--good-bg);color:var(--good)}
-.signal-badge[data-status="warning"]{background:var(--warn-bg);color:var(--warn)}
-.signal-badge[data-status="bad"]    {background:var(--bad-bg); color:var(--bad)}
-.signal-badge[data-status="neutral"]{background:rgba(124,132,155,.1);color:var(--text2)}
 
-.signal-hint{font-size:.8rem;color:var(--text2);line-height:1.45}
+.signal-top {
+    margin-bottom: 0.75rem;
+}
+
+.signal-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text2);
+}
+
+/* Главное число */
+.signal-badge-main {
+    display: flex;
+    align-items: baseline;
+    gap: 0.25rem;
+    margin-bottom: 0.5rem;
+}
+
+.signal-number {
+    font-size: 2rem;
+    font-weight: 800;
+    color: var(--accent);
+    line-height: 1;
+}
+
+.signal-unit {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text2);
+}
+
+.signal-period {
+    font-size: 0.75rem;
+    color: var(--text3);
+    margin-left: 0.25rem;
+}
+
+/* Статистика для MR и описаний */
+.signal-badge-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+}
+
+.mr-stat, .desc-stat {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text2);
+}
+
+.stat-num {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-right: 0.2rem;
+}
+
+.mr-stat.merged .stat-num { color: var(--good); }
+.mr-stat.opened .stat-num { color: var(--blue); }
+.mr-stat.closed .stat-num { color: var(--warn); }
+.desc-stat.good .stat-num { color: var(--good); }
+.desc-stat.bad .stat-num { color: var(--bad); }
+
+.signal-hint {
+    font-size: 0.7rem;
+    color: var(--text3);
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border);
+}
+/* Стили для списка всех разработчиков */
+.contributors-list {
+    margin-top: 0.5rem;
+    max-height: 400px;
+    overflow-y: auto;
+}
+.contributor-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+}
+.contributor-item:last-child {
+    border-bottom: none;
+}
+.contributor-rank {
+    font-size: 0.75rem;
+    color: var(--text2);
+    min-width: 35px;
+    font-weight: 600;
+}
+.contributor-name {
+    font-weight: 500;
+    flex: 1;
+    margin-left: 0.5rem;
+}
+.contributor-commits {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 0.85rem;
+    margin-right: 1rem;
+}
+.contributor-changes {
+    color: var(--text2);
+    font-size: 0.7rem;
+}
+
+/* ══════════════════════════════════════════
+   ПОДСВЕТКА СТАТИСТИКИ
+   ══════════════════════════════════════════ */
+.stat-highlight {
+    font-weight: 800;
+    font-size: 1.1em;
+    color: var(--accent);
+}
+
+.stat-highlight.stat-merged {
+    color: var(--good);
+}
+
+.stat-highlight.stat-opened {
+    color: var(--blue);
+}
+
+.stat-highlight.stat-closed {
+    color: var(--warn);
+}
+
+.stat-highlight.stat-good {
+    color: var(--good);
+}
+
+.stat-highlight.stat-bad {
+    color: var(--bad);
+}
+
+/* Для совместимости с signal-badge */
+.signal-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    padding: .25rem .7rem;
+    border-radius: 999px;
+    font-size: .78rem;
+    font-weight: 700;
+    white-space: normal;
+    word-break: break-word;
+    max-width: 100%;
+}
+
+.signal-badge .stat-highlight {
+    font-size: 0.9rem;
+    margin: 0 0.1rem;
+}
+
+/* Стили для разбивки по проектам */
+.projects-breakdown {
+    width: 100%;
+    margin-bottom: 1rem;
+}
+.projects-breakdown h4 {
+    margin-bottom: 0.75rem;
+    font-size: 0.9rem;
+    color: var(--text);
+}
+.project-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border);
+}
+.project-item:last-child {
+    border-bottom: none;
+}
+.project-name {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.project-stats {
+    font-size: 0.8rem;
+    color: var(--text2);
+}
+.project-stats strong {
+    color: var(--accent);
+}
 
 /* ══════════════════════════════════════════
    TABLE CARD  &  MR TABLE
@@ -354,8 +542,8 @@ a:hover{text-decoration:underline}
    ══════════════════════════════════════════ */
 @media(max-width:768px){
   .header-inner{flex-direction:column;align-items:flex-start}
-  .controls{width:100%}
-  .select-wrap{flex:1}
+  .controls{width:100%;flex-direction:column;align-items:stretch}
+  .select-wrap{flex:1;width:100%}
   .select-wrap select{width:100%}
   .project-bar{flex-direction:column;align-items:flex-start}
   .dashboard{padding:1rem}
@@ -370,3 +558,54 @@ a:hover{text-decoration:underline}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+
+/* ══════════════════════════════════════════
+   ГРАФИК
+   ══════════════════════════════════════════ */
+.chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+    margin-bottom: 1.5rem;
+}
+
+.chart-header {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 1rem;
+}
+
+.chart-controls {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.chart-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text2);
+    padding: 0.4rem 0.8rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.chart-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.chart-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+}
+
+@media (max-width: 768px) {
+    .chart-header {
+        justify-content: center;
+    }
+}

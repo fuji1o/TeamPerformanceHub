@@ -5,42 +5,56 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Team Performance Hub</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
   <link rel="stylesheet" href="styles.css"/>
 </head>
 <body>
 
-  <!-- ═══════════ HEADER ═══════════ -->
-  <header class="header">
-    <div class="header-inner">
-      <div class="logo">
-        <span class="logo-icon">◈</span>
-        <h1>Team Performance Hub</h1>
+<!-- ═══════════ HEADER ═══════════ -->
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-icon">◈</span>
+      <h1>Team Performance Hub</h1>
+    </div>
+    <div class="controls">
+      <div class="select-wrap">
+        <label for="viewModeSelect">Режим</label>
+        <select id="viewModeSelect">
+          <option value="developer" selected>👤 Отчёт по разработчику</option>
+          <option value="overview">📊 Общий обзор (все разработчики)</option>
+        </select>
       </div>
-      <div class="controls">
-        <div class="select-wrap">
-          <label for="developerSelect">Разработчик</label>
-          <select id="developerSelect">
-            <option value="">Загрузка…</option>
-          </select>
-        </div>
-        <div class="select-wrap">
-          <label for="periodSelect">Период</label>
-          <select id="periodSelect">
-            <option value="7">7 дней</option>
-            <option value="30" selected>30 дней</option>
-            <option value="90">90 дней</option>
-          </select>
-        </div>
+      <div class="select-wrap">
+        <label for="projectSelect">Проект</label>
+        <select id="projectSelect">
+          <option value="">🌍 Все проекты</option>
+        </select>
+      </div>
+      <div class="select-wrap" id="developerSelectWrap">
+        <label for="developerSelect">Разработчик</label>
+        <select id="developerSelect">
+          <option value="">Загрузка…</option>
+        </select>
+      </div>
+      <div class="select-wrap">
+        <label for="periodSelect">Период</label>
+        <select id="periodSelect">
+          <option value="7">7 дней</option>
+          <option value="30" selected>30 дней</option>
+          <option value="90">90 дней</option>
+        </select>
       </div>
     </div>
-  </header>
+  </div>
+</header>
 
   <!-- ═══════════ EMPTY STATE ═══════════ -->
   <main id="emptyState" class="empty-state">
     <div class="empty-icon">👤</div>
     <h2>Выберите разработчика</h2>
-    <p>Выберите имя в шапке, чтобы увидеть аналитику</p>
+    <p>Выберите проект и разработчика, чтобы увидеть аналитику</p>
   </main>
 
   <!-- ═══════════ LOADING ═══════════ -->
@@ -94,7 +108,18 @@
         <span class="num-label">Комментариев</span>
       </div>
     </section>
-
+    <!-- ── График активности ── -->
+<h2 class="section-title">📈 Активность коммитов</h2>
+<div class="chart-card">
+    <div class="chart-header">
+        <div class="chart-controls">
+            <button class="chart-btn active" data-range="week">Неделя</button>
+            <button class="chart-btn" data-range="month">Месяц</button>
+            <button class="chart-btn" data-range="quarter">3 месяца</button>
+        </div>
+    </div>
+    <canvas id="commitsChart" width="400" height="200" style="max-height: 300px; width: 100%;"></canvas>
+</div>
     <!-- ── Signal Cards ── -->
     <h2 class="section-title">Сигналы</h2>
     <section class="signals-grid" id="signalsGrid">
@@ -103,24 +128,23 @@
 
     <!-- ── MR Metrics Table (yes / no) ── -->
     <div class="table-card">
-  <div class="table-scroll">
-    <table class="mr-table">
-      <thead>
-        <tr>
-          <th>Merge Request</th>
-          <th>Статус</th>
-          <th>Описание</th>
-          <th>Коммитов</th>
-          <th>Время мержа</th>
-        </tr>
-      </thead>
-      <tbody id="mrTableBody">
-        <!-- Данные подставляются через JS -->
-      </tbody>
-    </table>
-  </div>
-</div>
-
+      <div class="table-scroll">
+        <table class="mr-table">
+          <thead>
+            <tr>
+              <th>Merge Request</th>
+              <th>Статус</th>
+              <th>Описание</th>
+              <th>Коммитов</th>
+              <th>Время мержа</th>
+            </tr>
+          </thead>
+          <tbody id="mrTableBody">
+            <!-- Данные подставляются через JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
 
     <!-- ── Comment Types ── -->
     <h2 class="section-title">Типы комментариев</h2>
