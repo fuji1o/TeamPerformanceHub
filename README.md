@@ -42,20 +42,6 @@ GITLAB_PROJECT_IDS=80386581,81167879
 DEEPSEEK_API_KEY=sk-ваш_ключ
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 
-## Запуск сервера
-cd backend
-python -m uvicorn main:app --reload
-
-Сервер запустится на http://127.0.0.1:8000
-
-## Запуск фронтенда
-Откройте новый терминал:
-cd frontend
-python -m http.server 3000
-
-Откройте браузер и перейдите по адресу: http://localhost:3000
-
-
 ## НАСТРОЙКА ПРОЕКТОВ
 
 В файле .env укажите ID проектов GitLab через запятую:
@@ -99,6 +85,20 @@ GITLAB_PROJECT_IDS=80386581,81167879
 Если в GitLab коммиты подписаны как "Olesya", а MR создаёт пользователь "Liccva":
 Добавьте в aliases: "Olesya": "Liccva"
 Система объединит все данные под пользователем "Liccva"
+
+
+## Запуск сервера
+cd backend
+python -m uvicorn main:app --reload
+
+Сервер запустится на http://127.0.0.1:8000
+
+## Запуск фронтенда
+Откройте новый терминал:
+cd frontend
+python -m http.server 3000
+
+Откройте браузер и перейдите по адресу: http://localhost:3000
 
 
 ## ВОЗМОЖНЫЕ ПРОБЛЕМЫ И РЕШЕНИЯ
