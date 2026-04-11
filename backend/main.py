@@ -6,7 +6,7 @@ from src.interfaces.api.routes import health, team, overview
 
 app = FastAPI(
     title="Team Performance Hub",
-    description="Дашборд активности разработчиков на основе GitLab (поддержка нескольких проектов)"
+    description="Дашборд активности разработчиков на основе GitLab"
 )
 
 app.add_middleware(
