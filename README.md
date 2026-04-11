@@ -96,8 +96,8 @@ GITLAB_PROJECT_IDS=80386581,81167879
 }
 
 ### Пример:
-Если в GitLab коммиты подписаны как "Olesya Shiryaeva", а MR создаёт пользователь "Liccva":
-Добавьте в aliases: "Olesya Shiryaeva": "Liccva"
+Если в GitLab коммиты подписаны как "Olesya", а MR создаёт пользователь "Liccva":
+Добавьте в aliases: "Olesya": "Liccva"
 Система объединит все данные под пользователем "Liccva"
 
 
