@@ -1,21 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
 # Виртуальное окружение
 venv/
 env/
 ENV/
+.venv
 
-# Кэш Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Секреты
+# Секреты и конфиги
 .env
 .env.local
+.env.*.local
+author_mapping.json
 
 # IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+
+# Логи и отчеты
+*.log
+full_analytics_report.json
 
 # OS
 .DS_Store

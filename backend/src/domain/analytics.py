@@ -3,21 +3,35 @@ import os
 import json
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 from dotenv import load_dotenv
 import aiohttp
 from gidgetlab.aiohttp import GitLabAPI
+from src.domain.user_mapper import UserMapper
 
 load_dotenv()
 
 
 class GitLabAnalyticsComplete:
-    def __init__(self):
+    def __init__(self, project_id: Optional[int] = None):
+        """
+        Args:
+            project_id: ID проекта или None для использования значения из .env
+        """
         self.token = os.getenv("GITLAB_TOKEN", "").strip()
-        self.project_id = os.getenv("GITLAB_PROJECT_ID", "").strip()
         self.url = os.getenv("GITLAB_URL", "https://gitlab.com").strip()
+        self.user_mapper = UserMapper()
+        
+        # Если project_id не передан, берём из env (для обратной совместимости)
+        if project_id is not None:
+            self.project_id = str(project_id)
+        else:
+            self.project_id = os.getenv("GITLAB_PROJECT_ID", "").strip() or None
 
     async def get_project_info(self) -> Dict:
+        if not self.project_id:
+            return {"name": "All Projects"}
+        
         async with aiohttp.ClientSession() as session:
             gl = GitLabAPI(session, self.token, url=self.url)
             try:
@@ -27,6 +41,9 @@ class GitLabAnalyticsComplete:
                 return {}
 
     async def get_all_branches(self) -> List[Dict]:
+        if not self.project_id:
+            return []
+        
         async with aiohttp.ClientSession() as session:
             gl = GitLabAPI(session, self.token, url=self.url)
             branches = []
@@ -45,6 +62,9 @@ class GitLabAnalyticsComplete:
 
     async def get_commits_for_branch(self, branch_name: str, days: int = 90, seen_ids: Set[str] = None) -> List[Dict]:
         """Получает коммиты для ветки, исключая уже обработанные"""
+        if not self.project_id:
+            return []
+        
         if seen_ids is None:
             seen_ids = set()
             
@@ -67,7 +87,7 @@ class GitLabAnalyticsComplete:
                             'short_id': commit['short_id'],
                             'title': commit['title'],
                             'message': commit['message'],
-                            'author_name': commit['author_name'],
+                            'author_name': self.user_mapper.normalize_author(commit['author_name']),
                             'author_email': commit['author_email'],
                             'created_at': commit['created_at'],
                             'date': commit_date,
@@ -92,7 +112,8 @@ class GitLabAnalyticsComplete:
                 'authors': {},
                 'commits_by_hour': {},
                 'commits_by_weekday': {},
-                'commits_by_date': {},
+                'commits_by_date': defaultdict(int),    
+                'commit_messages': {},
                 'first_commit': None,
                 'last_commit': None
             }
@@ -101,31 +122,52 @@ class GitLabAnalyticsComplete:
             'total_commits': len(commits),
             'total_additions': sum(c['additions'] for c in commits),
             'total_deletions': sum(c['deletions'] for c in commits),
-            'authors': defaultdict(lambda: {'commits': 0, 'additions': 0, 'deletions': 0}),
+            'authors': defaultdict(lambda: {'commits': 0, 'additions': 0, 'deletions': 0, 'activity_by_date': defaultdict(int)}),
             'commits_by_hour': defaultdict(int),
             'commits_by_weekday': defaultdict(int),
             'commits_by_date': defaultdict(int),
+            'commit_messages': defaultdict(list),
             'first_commit': commits[-1]['created_at'] if commits else None,
             'last_commit': commits[0]['created_at'] if commits else None
         }
         
         for commit in commits:
             author = commit['author_name']
+            date_str = commit['date'].date().isoformat()
             stats['authors'][author]['commits'] += 1
             stats['authors'][author]['additions'] += commit['additions']
             stats['authors'][author]['deletions'] += commit['deletions']
+            stats['commit_messages'][author].append(commit.get('message', ''))
             stats['commits_by_hour'][commit['hour']] += 1
             stats['commits_by_weekday'][commit['weekday']] += 1
-            stats['commits_by_date'][commit['date'].date().isoformat()] += 1
+            stats['commits_by_date'][date_str] += 1
+            stats['authors'][author]['activity_by_date'][date_str] += 1
+
+           
+        stats['authors'] = {k: {
+        'commits': v['commits'],
+        'additions': v['additions'],
+        'deletions': v['deletions'],
+        'activity_by_date': dict(v['activity_by_date']),
+        'commit_messages': stats['commit_messages'].get(k, []) 
+    } for k, v in stats['authors'].items()}
         
-        stats['authors'] = {k: dict(v) for k, v in stats['authors'].items()}
         stats['commits_by_hour'] = dict(stats['commits_by_hour'])
         stats['commits_by_weekday'] = dict(stats['commits_by_weekday'])
         stats['commits_by_date'] = dict(stats['commits_by_date'])
+        stats['commit_messages'] = dict(stats['commit_messages']) 
+        
+        print(f"[DEBUG] Total commits: {stats['total_commits']}")
+        print(f"[DEBUG] Authors: {list(stats['authors'].keys())}")
+        for author, data in stats['authors'].items():
+            print(f"[DEBUG]   {author}: {data['commits']} commits, activity_by_date: {data['activity_by_date']}")
         
         return stats
 
     async def get_merge_request_comments(self, mr_iid: int) -> List[Dict]:
+        if not self.project_id:
+            return []
+        
         comments = []
         url = f"{self.url}/api/v4/projects/{self.project_id}/merge_requests/{mr_iid}/discussions"
         headers = {"Authorization": f"Bearer {self.token}", "User-Agent": "TeamPerformanceHub/1.0"}
@@ -148,7 +190,7 @@ class GitLabAnalyticsComplete:
                                     continue
                                 comment = {
                                     'id': note['id'],
-                                    'author': note['author']['name'],
+                                    'author': self.user_mapper.normalize_author(note['author']['name']),
                                     'author_username': note['author']['username'],
                                     'created_at': note['created_at'],
                                     'body': note['body'],
@@ -187,6 +229,9 @@ class GitLabAnalyticsComplete:
 
     async def _get_mr_commits(self, gl, mr_iid: int) -> List[Dict]:
         """Получает коммиты MR с информацией об авторах"""
+        if not self.project_id:
+            return []
+        
         commits = []
         try:
             async for commit in gl.getiter(f"/projects/{self.project_id}/merge_requests/{mr_iid}/commits"):
@@ -202,6 +247,9 @@ class GitLabAnalyticsComplete:
         return commits
 
     async def get_merge_requests_detailed(self, days: int = 90) -> List[Dict]:
+        if not self.project_id:
+            return []
+        
         async with aiohttp.ClientSession() as session:
             gl = GitLabAPI(session, self.token, url=self.url)
             since_date = (datetime.now() - timedelta(days=days)).isoformat()
@@ -232,18 +280,18 @@ class GitLabAnalyticsComplete:
                             except Exception:
                                 pass
 
-                       
                         commit_authors = set()
                         for commit in commits:
                             if commit.get('author_name'):
                                 commit_authors.add(commit['author_name'])
                         
-                        #  кто делал коммиты
+                        # Кто делал коммиты
                         if commit_authors:
                             real_author = next(iter(commit_authors))
+                            real_author = self.user_mapper.normalize_author(real_author)
                             real_author_username = None
                             for commit in commits:
-                                if commit.get('author_name') == real_author:
+                                if self.user_mapper.normalize_author(commit.get('author_name', '')) == real_author:
                                     email = commit.get('author_email', '')
                                     if email:
                                         real_author_username = email.split('@')[0]
@@ -252,7 +300,7 @@ class GitLabAnalyticsComplete:
                                 real_author_username = real_author.lower().replace(' ', '.')
                         else:
                             # Если нет коммитов, используем автора MR
-                            real_author = mr['author']['name']
+                            real_author = self.user_mapper.normalize_author(mr['author']['name'])
                             real_author_username = mr['author']['username']
                         
                         # Информация о том, кто смержил
@@ -274,12 +322,10 @@ class GitLabAnalyticsComplete:
                             'iid': mr['iid'],
                             'title': mr['title'],
                             'description': mr.get('description', ''),
-                            # API автор (кто создал MR)
-                            'author': mr['author']['name'],
+                            'author': self.user_mapper.normalize_author(mr['author']['name']),
                             'author_username': mr['author']['username'],
                             'actual_author': real_author,
                             'actual_author_username': real_author_username,
-                            # Кто смержил
                             'merged_by': merged_by,
                             'merged_by_username': merged_by_username,
                             'created_at': mr['created_at'],
@@ -309,8 +355,6 @@ class GitLabAnalyticsComplete:
                             mr_data['time_to_merge_hours'] = None
                         
                         merge_requests.append(mr_data)
-                        print(f"[DEBUG] MR !{mr['iid']}: API author={mr['author']['name']}, "
-                              f"Real author={real_author}, Commits={len(commits)}")
                               
                 except Exception as e:
                     print(f"[ERROR] Ошибка получения MR со статусом {state}: {e}")
@@ -339,6 +383,13 @@ class GitLabAnalyticsComplete:
         
         first_comment = min(comments, key=lambda x: x['created_at'])
         first_time = datetime.fromisoformat(first_comment['created_at'].replace('Z', '+00:00'))
+        delay_hours = round((first_time - created_at).total_seconds() / 3600, 1)
+
+        print(f"[DEBUG] MR created: {created_at}")
+        print(f"[DEBUG] First comment: {first_time}")
+        print(f"[DEBUG] Delay hours: {delay_hours}")
+        print(f"[DEBUG] Comments count: {len(comments)}")
+    
         
         return {
             'total': len(comments),
@@ -402,9 +453,12 @@ class GitLabAnalyticsComplete:
         }
 
     async def generate_full_report(self, days: int = 30) -> Dict:
+        """Генерирует отчёт для текущего проекта"""
+        if not self.project_id:
+            raise ValueError("project_id is required for single project report")
+        
         branches = await self.get_all_branches()
         
-        # Используем set для дедупликации коммитов
         seen_commit_ids: Set[str] = set()
         all_commits = []
         
@@ -418,8 +472,10 @@ class GitLabAnalyticsComplete:
         
         all_mrs = await self.get_merge_requests_detailed(days=days)
         commit_stats = self.get_commit_activity_stats(all_commits)
+        print(f"[DEBUG] GitLabAnalyticsComplete: commit_messages keys = {list(commit_stats.get('commit_messages', {}).keys())}")
         
         return {
+            'project_id': int(self.project_id),
             'period_days': days,
             'generated_at': datetime.now().isoformat(),
             'project_name': (await self.get_project_info()).get('name', 'Unknown'),
@@ -430,7 +486,9 @@ class GitLabAnalyticsComplete:
                 'total_additions': commit_stats.get('total_additions', 0),
                 'total_deletions': commit_stats.get('total_deletions', 0),
                 'activity_by_hour': commit_stats.get('commits_by_hour', {}),
-                'activity_by_weekday': commit_stats.get('commits_by_weekday', {})
+                'activity_by_weekday': commit_stats.get('commits_by_weekday', {}),
+                'activity_by_date': commit_stats.get('commits_by_date', {}),
+                'commit_messages': commit_stats.get('commit_messages', {})
             },
             'merge_requests': {
                 'list': all_mrs,
@@ -467,7 +525,6 @@ class GitLabAnalyticsComplete:
             elif m['state'] == 'closed':
                 stats['closed'] += 1
             
-            # Используем actual_author для статистики
             stats['authors'][m['actual_author']] += 1
             
             if m.get('time_to_merge_hours') is not None:
@@ -504,5 +561,104 @@ class GitLabAnalyticsComplete:
         }
 
 
-if __name__ == "__main__":
-    asyncio.run(GitLabAnalyticsComplete().generate_full_report(30))
+class MultiProjectAnalytics:
+    """Агрегированная аналитика по нескольким проектам"""
+    
+    def __init__(self, project_ids: List[int]):
+        self.project_ids = project_ids
+        self.user_mapper = UserMapper()
+    
+    async def generate_aggregated_report(self, days: int = 30) -> Dict:
+        """Собирает отчёты по всем проектам и агрегирует"""
+        
+        all_commits_by_author = defaultdict(lambda: {
+            'commits': 0, 
+            'additions': 0, 
+            'deletions': 0, 
+            'projects': set(),
+            'activity_by_date': defaultdict(int),
+            'commit_messages': [] 
+
+        })
+        all_commits_by_date = defaultdict(int)
+        all_mrs = []
+        project_reports = {}
+        
+        # Параллельно собираем данные по проектам
+        tasks = []
+        for pid in self.project_ids:
+            analytics = GitLabAnalyticsComplete(project_id=pid)
+            tasks.append(self._fetch_project_report(analytics, pid, days))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for pid, result in zip(self.project_ids, results):
+            if isinstance(result, Exception):
+                print(f"[ERROR] Ошибка для проекта {pid}: {result}")
+                continue
+            
+            project_reports[pid] = {
+                'name': result.get('project_name', 'Unknown'),
+                'commits_total': result['commits']['total'],
+                'mrs_total': len(result['merge_requests']['list']),
+            }
+            
+            # Агрегируем коммиты по авторам
+            for author, stats in result['commits']['by_author'].items():
+                normalized = self.user_mapper.normalize_author(author)
+                print(f"[DEBUG MULTI] Проект {pid}: автор '{author}' -> '{normalized}'")
+                print(f"[DEBUG MULTI]   commits: {stats.get('commits', 0)}")
+                print(f"[DEBUG MULTI]   commit_messages count: {len(stats.get('commit_messages', []))}")
+                print(f"[DEBUG MULTI]   commit_messages: {stats.get('commit_messages', [])[:2]}")
+                all_commits_by_author[normalized]['commits'] += stats.get('commits', 0)
+                all_commits_by_author[normalized]['additions'] += stats.get('additions', 0)
+                all_commits_by_author[normalized]['deletions'] += stats.get('deletions', 0)
+                all_commits_by_author[normalized]['projects'].add(pid)
+
+                if 'commit_messages' in stats:
+                    all_commits_by_author[normalized]['commit_messages'].extend(stats['commit_messages'])   
+                if 'activity_by_date' in stats:
+                    for date, count in stats['activity_by_date'].items():
+                        all_commits_by_author[normalized]['activity_by_date'][date] += count
+
+            if result['commits'].get('activity_by_date'):
+                for date, count in result['commits']['activity_by_date'].items():
+                    all_commits_by_date[date] += count
+            
+            # Добавляем project_id к каждому MR
+            for mr in result['merge_requests']['list']:
+                mr['project_id'] = pid
+                mr['project_name'] = result.get('project_name', 'Unknown')
+                all_mrs.append(mr)
+        
+        # Конвертируем set в list для JSON
+        for author_data in all_commits_by_author.values():
+            author_data['projects'] = list(author_data['projects'])
+            author_data['activity_by_date'] = dict(author_data['activity_by_date'])
+        
+        return {
+            'mode': 'aggregated',
+            'project_ids': self.project_ids,
+            'projects': project_reports,
+            'period_days': days,
+            'generated_at': datetime.now().isoformat(),
+            'commits': {
+                'total': sum(p['commits_total'] for p in project_reports.values()),
+                'by_author': dict(all_commits_by_author),
+                'activity_by_date': dict(all_commits_by_date),
+                'commit_messages': {
+                    author: data['commit_messages'] 
+                    for author, data in all_commits_by_author.items()
+                }
+            },
+            'merge_requests': {
+                'list': all_mrs,
+                'total': len(all_mrs),
+            },
+        }
+    
+    async def _fetch_project_report(
+        self, analytics: GitLabAnalyticsComplete, project_id: int, days: int
+    ) -> Dict:
+        return await analytics.generate_full_report(days=days)
+

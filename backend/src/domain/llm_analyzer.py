@@ -1,4 +1,3 @@
-# test_analyzer.py — простой анализатор Conventional Commits с пожеланиями
 import asyncio
 import sys
 import os
@@ -7,9 +6,10 @@ import re
 from collections import defaultdict
 from openai import OpenAI
 from dotenv import load_dotenv
+from src.domain.user_mapper import UserMapper
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from analytics import GitLabAnalyticsComplete
+from src.domain.analytics import GitLabAnalyticsComplete
 
 load_dotenv()
 
@@ -25,7 +25,6 @@ class SimpleAnalyzer:
         
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = "deepseek-chat"
-        print(f"DeepSeek инициализирован")
     
     def check_conventional_commit(self, commit_message: str) -> dict:
         try:
@@ -54,19 +53,19 @@ class SimpleAnalyzer:
         except Exception as e:
             return {"is_conventional": False, "type": None, "issue": str(e)}
     
-    def generate_wish(self, author: str, ratio: int, total_commits: int) -> str:
-        """Генерирует пожелание для разработчика"""
+    def generate_summary(self, author: str, ratio: int, total_commits: int, conventional_count: int = 0) -> str:
+        """Генерирует общую информацию для аудитора"""
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "Ты тимлид. Напиши короткое пожелание разработчику по улучшению качества коммитов. Максимум 2 предложения. Без приветствий и подписей."
+                        "content": "Ты аудитор. Опиши кратко имещуюся ситуацию по разработчику. Максимум 2 предложения. Без приветствий и подписей. Учитывай процент соответствия."
                     },
                     {
                         "role": "user",
-                        "content": f"Разработчик {author}. У него {total_commits} коммитов, из них {ratio}% соответствуют Conventional Commits. Напиши пожелание."
+                        "content": f"Разработчик {author}. У него {total_commits} коммитов, из них {ratio}% соответствуют Conventional Commits.{conventional_count} из {total_commits} коммитов написаны по стандарту. Напиши summary."
                     }
                 ],
                 temperature=0.7,
@@ -74,12 +73,8 @@ class SimpleAnalyzer:
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            if ratio < 50:
-                return f"Старайтесь использовать формат feat: или fix: в начале сообщений коммитов."
-            elif ratio < 80:
-                return f"Хорошая работа! Продолжайте соблюдать стандарт Conventional Commits."
-            else:
-                return f"Отлично! Вы отлично соблюдаете стандарт коммитов. Так держать!"
+            print(f"[ERROR] LLM failed: {e}")
+            return f"Разработчик {author}: {conventional_count} из {total_commits} коммитов соответствуют Conventional Commits ({ratio}%)."
 
 
 async def analyze():
@@ -89,7 +84,7 @@ async def analyze():
     print("Загрузка данных из GitLab...")
     analytics = GitLabAnalyticsComplete()
     report = await analytics.generate_full_report(days=90)
-    
+    user_mapper = UserMapper()
 
     all_commits = []
     seen_ids = set()
@@ -106,7 +101,8 @@ async def analyze():
     
     commits_by_author = defaultdict(list)
     for commit in all_commits:
-        commits_by_author[commit['author']].append(commit)
+        normalized_author = user_mapper.normalize_author(commit['author'])
+        commits_by_author[normalized_author].append(commit)
 
     analyzer = SimpleAnalyzer()
     print("")
@@ -148,8 +144,8 @@ async def analyze():
             print("  Рекомендация: Используйте формат feat: текст, fix: текст, docs: текст")
         
         print("")
-        print("  Пожелание:")
-        wish = analyzer.generate_wish(author, ratio, len(commits))
+        print("  Summary:")
+        wish = analyzer.generate_summary(author, ratio, len(commits))
         print(f"    {wish}")
         
         print("")
@@ -163,7 +159,6 @@ async def analyze():
             'wish': wish
         })
     
-    # Итоговый отчет
     print("=" * 50)
     print("ИТОГОВЫЙ ОТЧЕТ")
     print("=" * 50)
