@@ -80,7 +80,7 @@ class ProjectManager:
                         if response.status == 200:
                             project = await response.json()
                             projects.append(self._normalize_project(project))
-                            print(f"[DEBUG]   ✅ Проект {pid} загружен")
+                            print(f"[DEBUG]   Проект {pid} загружен")
                         elif response.status == 404:
                             print(f"[WARN] Проект {pid} не найден или нет доступа (пропускаем)")
                         else:
@@ -98,7 +98,7 @@ class ProjectManager:
                 "membership": "true",
                 "per_page": 100,
                 "archived": "false",
-                "min_access_level": 30  # Developer и выше
+                "min_access_level": 30
             }
             async for project in gl.getiter("/projects", params=params):
                 projects.append(self._normalize_project(project))
