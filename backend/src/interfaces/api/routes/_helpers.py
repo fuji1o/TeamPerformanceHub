@@ -1,4 +1,4 @@
-"""Вспомогательные функции для роутеров"""
+"""Вспомогательные функции"""
 from typing import List, Optional, Dict
 from src.interfaces.api.schemas.response import SignalBox
 
@@ -64,3 +64,16 @@ def to_signal(value: Optional[float], metric: str) -> SignalBox:
         if value >= cfg["warning"]:
             return SignalBox(label=cfg["label"], status="warning", hint=hints.get("warning", ""))
         return SignalBox(label=cfg["label"], status="bad", hint=hints.get("bad", ""))
+
+
+def get_all_contributors(by_author: Dict) -> List[Dict]:
+    """Все пользователи"""
+    sorted_authors = sorted(
+        by_author.items(),
+        key=lambda x: x[1].get('commits', 0) if isinstance(x[1], dict) else x[1],
+        reverse=True
+    )
+    return [
+        {"name": name, "commits": stats.get('commits', stats) if isinstance(stats, dict) else stats}
+        for name, stats in sorted_authors
+    ]

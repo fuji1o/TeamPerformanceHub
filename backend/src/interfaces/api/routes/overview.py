@@ -4,7 +4,7 @@ from datetime import datetime
 
 from src.domain.analytics import GitLabAnalyticsComplete, MultiProjectAnalytics
 from src.infrastructure.project_manager import ProjectManager
-from src.interfaces.api.schemas.response import get_all_contributors
+from src.interfaces.api.routes._helpers import get_all_contributors
 
 router = APIRouter(tags=["overview"])
 project_manager = ProjectManager()
