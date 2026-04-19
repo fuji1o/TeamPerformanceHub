@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+import asyncio
 
 from src.interfaces.api.schemas.response import (
     DeveloperReportResponse, SignalBox, MRItem, MRQualityScore,
@@ -10,6 +11,7 @@ from src.domain.analytics import GitLabAnalyticsComplete, MultiProjectAnalytics
 from src.infrastructure.project_manager import ProjectManager
 from src.domain.user_mapper import UserMapper
 from src.domain.llm_analyzer import SimpleAnalyzer
+from src.infrastructure.progress_logger import progress, info as pinfo
 from . import _helpers
 
 router = APIRouter(tags=["team"])
@@ -228,18 +230,26 @@ async def get_full_report(
 
     commit_messages = report['commits'].get('commit_messages', {}).get(matched_author_name, [])
     analyzer = SimpleAnalyzer()
-    conventional_count = 0
-    for msg in commit_messages:
-        result = analyzer.check_conventional_commit(msg)
-        if result.get('is_conventional'):
-            conventional_count += 1
+    if commit_messages:
+        async with progress(f"LLM: checking {len(commit_messages)} commit messages (parallel)"):
+            results = await asyncio.gather(*[
+                asyncio.to_thread(analyzer.check_conventional_commit, msg)
+                for msg in commit_messages
+            ])
+            conventional_count = sum(1 for r in results if r.get('is_conventional'))
+            pinfo(f"conventional: {conventional_count}/{len(commit_messages)}")
+    else:
+        conventional_count = 0
+
     conventional_ratio = int(conventional_count / len(commit_messages) * 100) if commit_messages else 0
-    conversation_prompt = analyzer.generate_summary(
-        author=target_username,
-        ratio=conventional_ratio,
-        total_commits=commits_count,
-        conventional_count=conventional_count
-    )
+    async with progress("LLM: generating summary"):
+        conversation_prompt = await asyncio.to_thread(
+            analyzer.generate_summary,
+            target_username,
+            conventional_ratio,
+            commits_count,
+            conventional_count,
+        )
     
     return DeveloperReportResponse(
         developer=target_username,

@@ -3,10 +3,12 @@ import sys
 import os
 import json
 import re
+import hashlib
 from collections import defaultdict
 from openai import OpenAI
 from dotenv import load_dotenv
 from src.domain.user_mapper import UserMapper
+from src.infrastructure.cache import ttl_cache
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.domain.analytics import GitLabAnalyticsComplete
@@ -27,6 +29,12 @@ class SimpleAnalyzer:
         self.model = "deepseek-chat"
     
     def check_conventional_commit(self, commit_message: str) -> dict:
+        msg_hash = hashlib.sha1((commit_message or "").encode("utf-8")).hexdigest()[:16]
+        cache_key = f"llm.conventional:{msg_hash}"
+        cached_result = ttl_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -47,14 +55,23 @@ class SimpleAnalyzer:
             content = response.choices[0].message.content.strip()
             json_match = re.search(r'\{[^{}]*\}', content)
             if json_match:
-                return json.loads(json_match.group())
-            return {"is_conventional": False, "type": None, "issue": "Ошибка парсинга"}
-            
+                result = json.loads(json_match.group())
+            else:
+                result = {"is_conventional": False, "type": None, "issue": "Ошибка парсинга"}
+            ttl_cache.set(cache_key, result, ttl=0)
+            return result
+
         except Exception as e:
             return {"is_conventional": False, "type": None, "issue": str(e)}
     
     def generate_summary(self, author: str, ratio: int, total_commits: int, conventional_count: int = 0) -> str:
         """Генерирует общую информацию для аудитора"""
+        key_payload = f"{author}|{ratio}|{total_commits}|{conventional_count}"
+        cache_key = f"llm.summary:{hashlib.sha1(key_payload.encode()).hexdigest()[:16]}"
+        cached_result = ttl_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -71,7 +88,9 @@ class SimpleAnalyzer:
                 temperature=0.7,
                 max_tokens=150
             )
-            return response.choices[0].message.content.strip()
+            result = response.choices[0].message.content.strip()
+            ttl_cache.set(cache_key, result, ttl=300)
+            return result
         except Exception as e:
             print(f"[ERROR] LLM failed: {e}")
             return f"Разработчик {author}: {conventional_count} из {total_commits} коммитов соответствуют Conventional Commits ({ratio}%)."

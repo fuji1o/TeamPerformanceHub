@@ -22,4 +22,4 @@ async def get_project_info(project_id: int):
     project = await project_manager.get_project_by_id(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    return projectcd
+    return project

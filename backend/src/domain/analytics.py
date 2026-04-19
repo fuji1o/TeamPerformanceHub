@@ -7,6 +7,8 @@ from typing import List, Dict, Set, Optional
 from dotenv import load_dotenv
 import aiohttp
 from src.domain.user_mapper import UserMapper
+from src.infrastructure.cache import cached
+from src.infrastructure.progress_logger import progress, log as plog, info as pinfo, warn as pwarn
 
 load_dotenv()
 
@@ -120,15 +122,24 @@ class GitLabAnalyticsComplete:
         
         async with aiohttp.ClientSession() as session:
             commits_data = await self._gitlab_get_paginated(session, f"/projects/{self.project_id}/repository/commits", params)
-            
-            for commit in commits_data:
-                if commit['id'] in seen_ids:
-                    continue
-                seen_ids.add(commit['id'])
+            new_commits = [c for c in commits_data if c['id'] not in seen_ids]
+            for c in new_commits:
+                seen_ids.add(c['id'])
 
-                detail = await self._gitlab_get(session, f"/projects/{self.project_id}/repository/commits/{commit['id']}")
+            sem = asyncio.Semaphore(10)
+
+            async def _fetch_detail(commit):
+                async with sem:
+                    return await self._gitlab_get(
+                        session,
+                        f"/projects/{self.project_id}/repository/commits/{commit['id']}"
+                    )
+
+            details = await asyncio.gather(*[_fetch_detail(c) for c in new_commits])
+
+            for commit, detail in zip(new_commits, details):
                 stats = detail.get('stats', {}) if detail else {}
-                
+
                 commit_date = datetime.fromisoformat(commit['created_at'].replace('Z', '+00:00'))
                 commits.append({
                     'id': commit['id'],
@@ -199,12 +210,7 @@ class GitLabAnalyticsComplete:
         stats['commits_by_weekday'] = dict(stats['commits_by_weekday'])
         stats['commits_by_date'] = dict(stats['commits_by_date'])
         stats['commit_messages'] = dict(stats['commit_messages']) 
-        
-        print(f"[DEBUG] Total commits: {stats['total_commits']}")
-        print(f"[DEBUG] Authors: {list(stats['authors'].keys())}")
-        for author, data in stats['authors'].items():
-            print(f"[DEBUG]   {author}: {data['commits']} commits, activity_by_date: {data['activity_by_date']}")
-        
+
         return stats
 
     async def get_merge_request_comments(self, mr_iid: int) -> List[Dict]:
@@ -279,109 +285,206 @@ class GitLabAnalyticsComplete:
     async def get_merge_requests_detailed(self, days: int = 90) -> List[Dict]:
         if not self.project_id:
             return []
-        
+
         since_date = (datetime.now() - timedelta(days=days)).isoformat()
         merge_requests = []
-        
-        async with aiohttp.ClientSession() as session:
-            for state in ['opened', 'merged', 'closed']:
+
+        connector = aiohttp.TCPConnector(limit=20)
+        timeout = aiohttp.ClientTimeout(total=300)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            sem = aiohttp.ClientSession  # placeholder for clarity, real sem below
+            sem = asyncio.Semaphore(8)
+            async def _fetch_state(state):
                 params = {
                     "state": state,
                     "created_after": since_date,
                     "order_by": "updated_at",
                     "sort": "desc"
                 }
-                
-                mrs = await self._gitlab_get_paginated(session, f"/projects/{self.project_id}/merge_requests", params)
-                
+                mrs = await self._gitlab_get_paginated(
+                    session, f"/projects/{self.project_id}/merge_requests", params
+                )
+                return state, mrs
+
+            state_results = await asyncio.gather(
+                *[_fetch_state(s) for s in ['opened', 'merged', 'closed']]
+            )
+
+            async def _process_mr(mr, state):
+                async with sem:
+                    return await self._build_mr_data(session, mr, state, sem)
+
+            tasks = []
+            for state, mrs in state_results:
                 for mr in mrs:
-                    created_at = datetime.fromisoformat(mr['created_at'].replace('Z', '+00:00'))
-                    
-                    comments, commits = await asyncio.gather(
-                        self.get_merge_request_comments(mr['iid']),
-                        self._get_mr_commits(mr['iid'])
-                    )
-                    
-                    comment_stats = self._calculate_comment_stats(comments, created_at)
+                    tasks.append(_process_mr(mr, state))
 
-                    total_additions, total_deletions = 0, 0
-                    for c in commits:
-                        detail = await self._gitlab_get(session, f"/projects/{self.project_id}/repository/commits/{c['id']}")
-                        if detail:
-                            s = detail.get('stats', {})
-                            total_additions += s.get('additions', 0)
-                            total_deletions += s.get('deletions', 0)
+            mr_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    commit_authors = set(c['author_name'] for c in commits if c.get('author_name'))
-                    if commit_authors:
-                        real_author = next(iter(commit_authors))
-                        real_author = self.user_mapper.normalize_author(real_author)
-                        real_author_username = None
-                        for commit in commits:
-                            if self.user_mapper.normalize_author(commit.get('author_name', '')) == real_author:
-                                email = commit.get('author_email', '')
-                                if email:
-                                    real_author_username = email.split('@')[0]
-                                break
-                        if not real_author_username:
-                            real_author_username = real_author.lower().replace(' ', '.')
-                    else:
-                        real_author = self.user_mapper.normalize_author(mr['author']['name'])
-                        real_author_username = mr['author']['username']
+            for r in mr_results:
+                if isinstance(r, Exception):
+                    print(f"[ERROR] Ошибка обработки MR: {r}")
+                    continue
+                if r is not None:
+                    merge_requests.append(r)
 
-                    merged_by = None
-                    merged_by_username = None
-                    if mr.get('merged_by'):
-                        merged_by = mr['merged_by'].get('name')
-                        merged_by_username = mr['merged_by'].get('username')
-                    elif mr.get('merge_user'):
-                        merged_by = mr['merge_user'].get('name')
-                        merged_by_username = mr['merge_user'].get('username')
-                    
-                    total_changes = total_additions + total_deletions
-                    mr_quality = self._calculate_mr_quality_score(
-                        mr, commits, comments, total_changes, total_additions, total_deletions
-                    )
-                    
-                    mr_data = {
-                        'iid': mr['iid'],
-                        'title': mr['title'],
-                        'description': mr.get('description', ''),
-                        'author': self.user_mapper.normalize_author(mr['author']['name']),
-                        'author_username': mr['author']['username'],
-                        'actual_author': real_author,
-                        'actual_author_username': real_author_username,
-                        'merged_by': merged_by,
-                        'merged_by_username': merged_by_username,
-                        'created_at': mr['created_at'],
-                        'merged_at': mr.get('merged_at'),
-                        'state': state,
-                        'source_branch': mr['source_branch'],
-                        'target_branch': mr['target_branch'],
-                        'web_url': mr['web_url'],
-                        'changes_count': mr.get('changes_count', 0),
-                        'total_additions': total_additions,
-                        'total_deletions': total_deletions,
-                        'total_changes': total_changes,
-                        'commits_count': len(commits),
-                        'comments': comments,
-                        'comment_stats': comment_stats,
-                        'quality_score': mr_quality,
-                        'iterations': self._count_iterations(commits, created_at),
-                        'total_lines_changed': total_changes,
-                        'additions': total_additions,
-                        'deletions': total_deletions
-                    }
-                    
-                    if state == 'merged' and mr.get('merged_at'):
-                        merged_at = datetime.fromisoformat(mr['merged_at'].replace('Z', '+00:00'))
-                        mr_data['time_to_merge_hours'] = (merged_at - created_at).total_seconds() / 3600
-                    else:
-                        mr_data['time_to_merge_hours'] = None
-                    
-                    merge_requests.append(mr_data)
-        
         return merge_requests
+
+    async def _build_mr_data(
+        self,
+        session: aiohttp.ClientSession,
+        mr: Dict,
+        state: str,
+        sem: asyncio.Semaphore
+    ) -> Optional[Dict]:
+        """Собирает полный объект данных для одного MR. Использует общий session+sem."""
+        try:
+            created_at = datetime.fromisoformat(mr['created_at'].replace('Z', '+00:00'))
+            comments, commits = await asyncio.gather(
+                self._get_mr_comments_with_session(session, mr['iid']),
+                self._get_mr_commits_with_session(session, mr['iid'])
+            )
+
+            comment_stats = self._calculate_comment_stats(comments, created_at)
+            async def _fetch_commit_stats(c):
+                async with sem:
+                    return await self._gitlab_get(
+                        session,
+                        f"/projects/{self.project_id}/repository/commits/{c['id']}"
+                    )
+
+            commit_details = await asyncio.gather(*[_fetch_commit_stats(c) for c in commits])
+
+            total_additions = sum(
+                (d.get('stats', {}).get('additions', 0) if d else 0)
+                for d in commit_details
+            )
+            total_deletions = sum(
+                (d.get('stats', {}).get('deletions', 0) if d else 0)
+                for d in commit_details
+            )
+
+            commit_authors = set(c['author_name'] for c in commits if c.get('author_name'))
+            if commit_authors:
+                real_author = next(iter(commit_authors))
+                real_author = self.user_mapper.normalize_author(real_author)
+                real_author_username = None
+                for commit in commits:
+                    if self.user_mapper.normalize_author(commit.get('author_name', '')) == real_author:
+                        email = commit.get('author_email', '')
+                        if email:
+                            real_author_username = email.split('@')[0]
+                        break
+                if not real_author_username:
+                    real_author_username = real_author.lower().replace(' ', '.')
+            else:
+                real_author = self.user_mapper.normalize_author(mr['author']['name'])
+                real_author_username = mr['author']['username']
+
+            merged_by = None
+            merged_by_username = None
+            if mr.get('merged_by'):
+                merged_by = mr['merged_by'].get('name')
+                merged_by_username = mr['merged_by'].get('username')
+            elif mr.get('merge_user'):
+                merged_by = mr['merge_user'].get('name')
+                merged_by_username = mr['merge_user'].get('username')
+
+            total_changes = total_additions + total_deletions
+            mr_quality = self._calculate_mr_quality_score(
+                mr, commits, comments, total_changes, total_additions, total_deletions
+            )
+
+            mr_data = {
+                'iid': mr['iid'],
+                'title': mr['title'],
+                'description': mr.get('description', ''),
+                'author': self.user_mapper.normalize_author(mr['author']['name']),
+                'author_username': mr['author']['username'],
+                'actual_author': real_author,
+                'actual_author_username': real_author_username,
+                'merged_by': merged_by,
+                'merged_by_username': merged_by_username,
+                'created_at': mr['created_at'],
+                'merged_at': mr.get('merged_at'),
+                'state': state,
+                'source_branch': mr['source_branch'],
+                'target_branch': mr['target_branch'],
+                'web_url': mr['web_url'],
+                'changes_count': mr.get('changes_count', 0),
+                'total_additions': total_additions,
+                'total_deletions': total_deletions,
+                'total_changes': total_changes,
+                'commits_count': len(commits),
+                'comments': comments,
+                'comment_stats': comment_stats,
+                'quality_score': mr_quality,
+                'iterations': self._count_iterations(commits, created_at),
+                'total_lines_changed': total_changes,
+                'additions': total_additions,
+                'deletions': total_deletions
+            }
+
+            if state == 'merged' and mr.get('merged_at'):
+                merged_at = datetime.fromisoformat(mr['merged_at'].replace('Z', '+00:00'))
+                mr_data['time_to_merge_hours'] = (merged_at - created_at).total_seconds() / 3600
+            else:
+                mr_data['time_to_merge_hours'] = None
+
+            return mr_data
+        except Exception as e:
+            print(f"[ERROR] Не удалось обработать MR !{mr.get('iid', '?')}: {e}")
+            return None
+
+    async def _get_mr_comments_with_session(
+        self, session: aiohttp.ClientSession, mr_iid: int
+    ) -> List[Dict]:
+        """Версия get_merge_request_comments, использующая переданную сессию."""
+        if not self.project_id:
+            return []
+        comments = []
+        endpoint = f"/projects/{self.project_id}/merge_requests/{mr_iid}/discussions"
+        discussions = await self._gitlab_get_paginated(session, endpoint)
+        for discussion in discussions:
+            for note in discussion.get('notes', []):
+                if note.get('system', False):
+                    continue
+                comment = {
+                    'id': note['id'],
+                    'author': self.user_mapper.normalize_author(note['author']['name']),
+                    'author_username': note['author']['username'],
+                    'created_at': note['created_at'],
+                    'body': note['body'],
+                    'type': self._classify_comment(note['body']),
+                    'is_reply': note.get('type') == 'DiscussionNote',
+                    'discussion_id': discussion.get('id')
+                }
+                if note.get('position'):
+                    pos = note['position']
+                    comment['file_path'] = pos.get('new_path') or pos.get('old_path')
+                    comment['line'] = pos.get('new_line') or pos.get('old_line')
+                comments.append(comment)
+        return comments
+
+    async def _get_mr_commits_with_session(
+        self, session: aiohttp.ClientSession, mr_iid: int
+    ) -> List[Dict]:
+        """Версия _get_mr_commits, использующая переданную сессию."""
+        if not self.project_id:
+            return []
+        commits = []
+        endpoint = f"/projects/{self.project_id}/merge_requests/{mr_iid}/commits"
+        commits_data = await self._gitlab_get_paginated(session, endpoint)
+        for commit in commits_data:
+            commits.append({
+                'id': commit['id'],
+                'created_at': commit['created_at'],
+                'title': commit['title'],
+                'author_name': commit.get('author_name', ''),
+                'author_email': commit.get('author_email', '')
+            })
+        return commits
 
     def _calculate_comment_stats(self, comments: List[Dict], created_at: datetime) -> Dict:
         if not comments:
@@ -407,11 +510,6 @@ class GitLabAnalyticsComplete:
         first_time = datetime.fromisoformat(first_comment['created_at'].replace('Z', '+00:00'))
         delay_hours = round((first_time - created_at).total_seconds() / 3600, 1)
 
-        print(f"[DEBUG] MR created: {created_at}")
-        print(f"[DEBUG] First comment: {first_time}")
-        print(f"[DEBUG] Delay hours: {delay_hours}")
-        print(f"[DEBUG] Comments count: {len(comments)}")
-    
         return {
             'total': len(comments),
             'by_type': dict(by_type),
@@ -473,51 +571,77 @@ class GitLabAnalyticsComplete:
         }
 
     async def generate_full_report(self, days: int = 30) -> Dict:
-        """Генерирует отчёт для текущего проекта"""
+        """Генерирует отчёт для текущего проекта (с кэшем 5 мин)"""
         if not self.project_id:
             raise ValueError("project_id is required for single project report")
-        
-        branches = await self.get_all_branches()
-        
-        seen_commit_ids: Set[str] = set()
-        all_commits = []
-        
-        for branch in branches:
-            commits = await self.get_commits_for_branch(
-                branch['name'], 
-                days=days, 
-                seen_ids=seen_commit_ids
-            )
-            all_commits.extend(commits)
-        
-        all_mrs = await self.get_merge_requests_detailed(days=days)
-        commit_stats = self.get_commit_activity_stats(all_commits)
-        print(f"[DEBUG] GitLabAnalyticsComplete: commit_messages keys = {list(commit_stats.get('commit_messages', {}).keys())}")
-        
-        project_info = await self.get_project_info()
-        
-        return {
-            'project_id': int(self.project_id),
-            'period_days': days,
-            'generated_at': datetime.now().isoformat(),
-            'project_name': project_info.get('name', 'Unknown'),
-            'total_branches': len(branches),
-            'commits': {
-                'total': len(all_commits),
-                'by_author': commit_stats.get('authors', {}),
-                'total_additions': commit_stats.get('total_additions', 0),
-                'total_deletions': commit_stats.get('total_deletions', 0),
-                'activity_by_hour': commit_stats.get('commits_by_hour', {}),
-                'activity_by_weekday': commit_stats.get('commits_by_weekday', {}),
-                'activity_by_date': commit_stats.get('commits_by_date', {}),
-                'commit_messages': commit_stats.get('commit_messages', {})
-            },
-            'merge_requests': {
-                'list': all_mrs,
-                'stats': self._aggregate_mr_stats(all_mrs)
-            },
-            'comments': self._aggregate_comments_stats(all_mrs)
-        }
+        return await self._generate_full_report_cached(self.project_id, days)
+
+    @cached(ttl=300, key_prefix="analytics.full_report")
+    async def _generate_full_report_cached(self, project_id: str, days: int) -> Dict:
+        """Реальная генерация отчёта. Ключ кэша = (project_id, days)."""
+        async with progress(f"Project {project_id}: full report (days={days})"):
+            async with progress("Fetching branches"):
+                branches = await self.get_all_branches()
+                pinfo(f"got {len(branches)} branches")
+
+            seen_commit_ids: Set[str] = set()
+            all_commits = []
+            sem = asyncio.Semaphore(5)
+
+            async def _fetch_branch_commits(branch):
+                async with sem:
+                    return await self.get_commits_for_branch(
+                        branch['name'],
+                        days=days,
+                        seen_ids=set()
+                    )
+
+            async with progress(f"Fetching commits for {len(branches)} branches in parallel"):
+                branch_results = await asyncio.gather(
+                    *[_fetch_branch_commits(b) for b in branches],
+                    return_exceptions=True
+                )
+
+            for result in branch_results:
+                if isinstance(result, Exception):
+                    pwarn(f"Branch fetch error: {result}")
+                    continue
+                for commit in result:
+                    if commit['id'] in seen_commit_ids:
+                        continue
+                    seen_commit_ids.add(commit['id'])
+                    all_commits.append(commit)
+            pinfo(f"deduplicated commits: {len(all_commits)}")
+
+            async with progress("Fetching merge requests"):
+                all_mrs = await self.get_merge_requests_detailed(days=days)
+                pinfo(f"got {len(all_mrs)} MRs")
+
+            commit_stats = self.get_commit_activity_stats(all_commits)
+            project_info = await self.get_project_info()
+
+            return {
+                'project_id': int(self.project_id),
+                'period_days': days,
+                'generated_at': datetime.now().isoformat(),
+                'project_name': project_info.get('name', 'Unknown'),
+                'total_branches': len(branches),
+                'commits': {
+                    'total': len(all_commits),
+                    'by_author': commit_stats.get('authors', {}),
+                    'total_additions': commit_stats.get('total_additions', 0),
+                    'total_deletions': commit_stats.get('total_deletions', 0),
+                    'activity_by_hour': commit_stats.get('commits_by_hour', {}),
+                    'activity_by_weekday': commit_stats.get('commits_by_weekday', {}),
+                    'activity_by_date': commit_stats.get('commits_by_date', {}),
+                    'commit_messages': commit_stats.get('commit_messages', {})
+                },
+                'merge_requests': {
+                    'list': all_mrs,
+                    'stats': self._aggregate_mr_stats(all_mrs)
+                },
+                'comments': self._aggregate_comments_stats(all_mrs)
+            }
 
     def _aggregate_mr_stats(self, mrs: List[Dict]) -> Dict:
         if not mrs:
@@ -591,91 +715,97 @@ class MultiProjectAnalytics:
         self.user_mapper = UserMapper()
     
     async def generate_aggregated_report(self, days: int = 30) -> Dict:
-        """Собирает отчёты по всем проектам и агрегирует"""
+        """Собирает отчёты по всем проектам и агрегирует (с кэшем 5 мин)"""
+        return await self._generate_aggregated_report_cached(tuple(sorted(self.project_ids)), days)
+
+    @cached(ttl=300, key_prefix="analytics.aggregated_report")
+    async def _generate_aggregated_report_cached(self, project_ids_key: tuple, days: int) -> Dict:
+        """Реальная агрегация. Ключ = (sorted(project_ids), days)."""
+
+        async with progress(f"Aggregated report: {len(self.project_ids)} projects (days={days})"):
+            all_commits_by_author = defaultdict(lambda: {
+                'commits': 0,
+                'additions': 0,
+                'deletions': 0,
+                'projects': set(),
+                'activity_by_date': defaultdict(int),
+                'commit_messages': []
+            })
+            all_commits_by_date = defaultdict(int)
+            all_mrs = []
+            project_reports = {}
+
+            tasks = []
+            for pid in self.project_ids:
+                analytics = GitLabAnalyticsComplete(project_id=pid)
+                tasks.append(self._fetch_project_report(analytics, pid, days))
+
+            async with progress(f"Fetching {len(tasks)} project reports in parallel"):
+                results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        all_commits_by_author = defaultdict(lambda: {
-            'commits': 0, 
-            'additions': 0, 
-            'deletions': 0, 
-            'projects': set(),
-            'activity_by_date': defaultdict(int),
-            'commit_messages': [] 
-        })
-        all_commits_by_date = defaultdict(int)
-        all_mrs = []
-        project_reports = {}
-        
-        tasks = []
-        for pid in self.project_ids:
-            analytics = GitLabAnalyticsComplete(project_id=pid)
-            tasks.append(self._fetch_project_report(analytics, pid, days))
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for pid, result in zip(self.project_ids, results):
-            if isinstance(result, Exception):
-                print(f"[ERROR] Ошибка для проекта {pid}: {result}")
-                continue
-            
-            project_reports[pid] = {
-                'name': result.get('project_name', 'Unknown'),
-                'commits_total': result['commits']['total'],
-                'mrs_total': len(result['merge_requests']['list']),
+            async with progress("Aggregating data from project reports"):
+                for pid, result in zip(self.project_ids, results):
+                    if isinstance(result, Exception):
+                        pwarn(f"Project {pid} failed: {result}")
+                        continue
+
+                    project_reports[pid] = {
+                        'name': result.get('project_name', 'Unknown'),
+                        'commits_total': result['commits']['total'],
+                        'mrs_total': len(result['merge_requests']['list']),
+                    }
+
+                    for author, stats in result['commits']['by_author'].items():
+                        normalized = self.user_mapper.normalize_author(author)
+
+                        all_commits_by_author[normalized]['commits'] += stats.get('commits', 0)
+                        all_commits_by_author[normalized]['additions'] += stats.get('additions', 0)
+                        all_commits_by_author[normalized]['deletions'] += stats.get('deletions', 0)
+                        all_commits_by_author[normalized]['projects'].add(pid)
+
+                        if 'commit_messages' in stats:
+                            all_commits_by_author[normalized]['commit_messages'].extend(stats['commit_messages'])
+                        if 'activity_by_date' in stats:
+                            for date, count in stats['activity_by_date'].items():
+                                all_commits_by_author[normalized]['activity_by_date'][date] += count
+
+                    if result['commits'].get('activity_by_date'):
+                        for date, count in result['commits']['activity_by_date'].items():
+                            all_commits_by_date[date] += count
+
+                    for mr in result['merge_requests']['list']:
+                        mr['project_id'] = pid
+                        mr['project_name'] = result.get('project_name', 'Unknown')
+                        all_mrs.append(mr)
+
+                for author_data in all_commits_by_author.values():
+                    author_data['projects'] = list(author_data['projects'])
+                    author_data['activity_by_date'] = dict(author_data['activity_by_date'])
+
+                pinfo(f"aggregated: {sum(p['commits_total'] for p in project_reports.values())} commits, {len(all_mrs)} MRs, {len(all_commits_by_author)} authors")
+
+            return {
+                'mode': 'aggregated',
+                'project_ids': self.project_ids,
+                'projects': project_reports,
+                'period_days': days,
+                'generated_at': datetime.now().isoformat(),
+                'commits': {
+                    'total': sum(p['commits_total'] for p in project_reports.values()),
+                    'by_author': dict(all_commits_by_author),
+                    'activity_by_date': dict(all_commits_by_date),
+                    'commit_messages': {
+                        author: data['commit_messages']
+                        for author, data in all_commits_by_author.items()
+                    }
+                },
+                'merge_requests': {
+                    'list': all_mrs,
+                    'total': len(all_mrs),
+                },
             }
-            
-            for author, stats in result['commits']['by_author'].items():
-                normalized = self.user_mapper.normalize_author(author)
-                print(f"[DEBUG MULTI] Проект {pid}: автор '{author}' -> '{normalized}'")
-                print(f"[DEBUG MULTI]   commits: {stats.get('commits', 0)}")
-                print(f"[DEBUG MULTI]   commit_messages count: {len(stats.get('commit_messages', []))}")
-                print(f"[DEBUG MULTI]   commit_messages: {stats.get('commit_messages', [])[:2]}")
-                
-                all_commits_by_author[normalized]['commits'] += stats.get('commits', 0)
-                all_commits_by_author[normalized]['additions'] += stats.get('additions', 0)
-                all_commits_by_author[normalized]['deletions'] += stats.get('deletions', 0)
-                all_commits_by_author[normalized]['projects'].add(pid)
-
-                if 'commit_messages' in stats:
-                    all_commits_by_author[normalized]['commit_messages'].extend(stats['commit_messages'])   
-                if 'activity_by_date' in stats:
-                    for date, count in stats['activity_by_date'].items():
-                        all_commits_by_author[normalized]['activity_by_date'][date] += count
-
-            if result['commits'].get('activity_by_date'):
-                for date, count in result['commits']['activity_by_date'].items():
-                    all_commits_by_date[date] += count
-
-            for mr in result['merge_requests']['list']:
-                mr['project_id'] = pid
-                mr['project_name'] = result.get('project_name', 'Unknown')
-                all_mrs.append(mr)
-        
-        for author_data in all_commits_by_author.values():
-            author_data['projects'] = list(author_data['projects'])
-            author_data['activity_by_date'] = dict(author_data['activity_by_date'])
-        
-        return {
-            'mode': 'aggregated',
-            'project_ids': self.project_ids,
-            'projects': project_reports,
-            'period_days': days,
-            'generated_at': datetime.now().isoformat(),
-            'commits': {
-                'total': sum(p['commits_total'] for p in project_reports.values()),
-                'by_author': dict(all_commits_by_author),
-                'activity_by_date': dict(all_commits_by_date),
-                'commit_messages': {
-                    author: data['commit_messages'] 
-                    for author, data in all_commits_by_author.items()
-                }
-            },
-            'merge_requests': {
-                'list': all_mrs,
-                'total': len(all_mrs),
-            },
-        }
     
     async def _fetch_project_report(
         self, analytics: GitLabAnalyticsComplete, project_id: int, days: int
     ) -> Dict:
-        return await analytics.generate_full_report(days=days)
+        return await analytics.generate_full_report(days=days)  
