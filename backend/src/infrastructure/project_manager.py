@@ -1,14 +1,16 @@
+import asyncio
 import os
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
-import aiohttp
 from gidgetlab.aiohttp import GitLabAPI
+
+from src.infrastructure.http_session import get_session
 
 load_dotenv()
 
 class ProjectManager:
     """Управление списком проектов для аналитики"""
-    
+
     def __init__(self):
         self.token = os.getenv("GITLAB_TOKEN", "").strip()
         self.url = os.getenv("GITLAB_URL", "https://gitlab.com").strip()
@@ -26,19 +28,18 @@ class ProjectManager:
         if self._projects_cache and not force_refresh:
             print(f"[DEBUG] Использую кэш проектов ({len(self._projects_cache)} проектов)")
             return self._projects_cache
-        
+
         print("[DEBUG] Загрузка проектов из GitLab API...")
-        projects = []
-        
-        async with aiohttp.ClientSession() as session:
-            gl = GitLabAPI(session, self.token, url=self.url)         
-            if self.group_id:
-                projects = await self._fetch_group_projects(gl)
-            elif self.configured_project_ids:
-                projects = await self._fetch_specific_projects(gl)
-            else:
-                projects = await self._fetch_user_projects(gl)
-        
+        session = get_session()
+        gl = GitLabAPI(session, self.token, url=self.url)
+
+        if self.group_id:
+            projects = await self._fetch_group_projects(gl)
+        elif self.configured_project_ids:
+            projects = await self._fetch_specific_projects(session)
+        else:
+            projects = await self._fetch_user_projects(gl)
+
         self._projects_cache = projects
         print(f"[DEBUG] Загружено проектов: {len(projects)}")
         for p in projects:
@@ -55,7 +56,7 @@ class ProjectManager:
                 "archived": "false"
             }
             async for project in gl.getiter(
-                f"/groups/{self.group_id}/projects", 
+                f"/groups/{self.group_id}/projects",
                 params=params
             ):
                 projects.append(self._normalize_project(project))
@@ -63,32 +64,34 @@ class ProjectManager:
             print(f"[ERROR] Ошибка загрузки проектов группы {self.group_id}: {e}")
         return projects
 
-    async def _fetch_specific_projects(self, gl: GitLabAPI) -> List[Dict]:
-        """Загружает конкретные проекты по ID через raw aiohttp с PRIVATE-TOKEN"""
-        projects = []
+    async def _fetch_specific_projects(self, session) -> List[Dict]:
+        """Параллельно загружает конкретные проекты по ID через raw aiohttp"""
         headers = {
             "PRIVATE-TOKEN": self.token,
-            "User-Agent": "TeamPerformanceHub/1.0"
+            "User-Agent": "TeamPerformanceHub/1.0",
         }
-        
-        for pid in self.configured_project_ids:
+
+        async def fetch_one(pid: str) -> Optional[Dict]:
             try:
                 print(f"[DEBUG] Загрузка проекта {pid}...")
                 url = f"{self.url}/api/v4/projects/{pid}"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            project = await response.json()
-                            projects.append(self._normalize_project(project))
-                            print(f"[DEBUG]   Проект {pid} загружен")
-                        elif response.status == 404:
-                            print(f"[WARN] Проект {pid} не найден или нет доступа (пропускаем)")
-                        else:
-                            error_body = await response.text()
-                            print(f"[ERROR] Проект {pid}: HTTP {response.status} — {error_body[:200]}")
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        project = await response.json()
+                        print(f"[DEBUG]   Проект {pid} загружен")
+                        return self._normalize_project(project)
+                    if response.status == 404:
+                        print(f"[WARN] Проект {pid} не найден или нет доступа (пропускаем)")
+                        return None
+                    error_body = await response.text()
+                    print(f"[ERROR] Проект {pid}: HTTP {response.status} — {error_body[:200]}")
+                    return None
             except Exception as e:
                 print(f"[ERROR] Сетевая ошибка для проекта {pid}: {type(e).__name__}: {e}")
-        return projects
+                return None
+
+        results = await asyncio.gather(*(fetch_one(pid) for pid in self.configured_project_ids))
+        return [p for p in results if p]
 
     async def _fetch_user_projects(self, gl: GitLabAPI) -> List[Dict]:
         """Загружает все проекты, доступные пользователю"""

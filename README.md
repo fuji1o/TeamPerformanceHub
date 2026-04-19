@@ -1,25 +1,26 @@
 ## УСТАНОВКА И ЗАПУСК
-версия python 3.11+ 
+версия python 3.11+
+проект использует [uv](https://docs.astral.sh/uv/) для управления зависимостями
+
+## Установка uv
+
+**Windows (PowerShell):**
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+**Mac/Linux:**
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 ## Клонирование репозитория
 git clone https://github.com/fuji1o/TeamPerformanceHub.git
 cd TeamPerformanceHub
 
 ## Настройка бэкенда
 
-### Создание виртуального окружения:
-
-**Windows:**
-cd backend
-python -m venv venv
-venv\Scripts\activate
-
-**Mac/Linux:**
-cd backend
-python3 -m venv venv
-source venv/bin/activate
-
 ### Установка зависимостей:
-pip install -r requirements.txt
+cd backend
+uv sync
+
+uv автоматически создаст виртуальное окружение `.venv` и установит нужную версию Python 3.11, если её нет в системе.
 
 ## Настройка переменных окружения
 
@@ -89,7 +90,7 @@ GITLAB_PROJECT_IDS=80386581,81167879
 
 ## Запуск сервера
 cd backend
-python -m uvicorn main:app --reload
+uv run uvicorn main:app --reload
 
 Сервер запустится на http://127.0.0.1:8000
 
@@ -99,6 +100,15 @@ cd frontend
 python -m http.server 3000
 
 Откройте браузер и перейдите по адресу: http://localhost:3000
+
+
+## Добавление новых зависимостей
+
+Для добавления новой библиотеки используйте:
+uv add имя_пакета
+
+Для удаления:
+uv remove имя_пакета
 
 
 ## ВОЗМОЖНЫЕ ПРОБЛЕМЫ И РЕШЕНИЯ

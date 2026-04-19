@@ -1,3 +1,4 @@
+import time
 from fastapi import APIRouter, Query, HTTPException
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -84,7 +85,10 @@ async def get_full_report(
     - project_id=123 — только один проект
     """
     target_username = user_mapper.normalize_author(username)
-    
+    t_total = time.perf_counter()
+    print(f"[team] /report username={username!r} days={days} project_id={project_id} — старт", flush=True)
+
+    t = time.perf_counter()
     if project_id:
         analytics = GitLabAnalyticsComplete(project_id=project_id)
         report = await analytics.generate_full_report(days=days)
@@ -94,15 +98,17 @@ async def get_full_report(
     else:
         projects = await project_manager.get_all_projects()
         project_ids = [p['id'] for p in projects]
-        
+
         if not project_ids:
             raise HTTPException(status_code=404, detail="No projects available")
-        
+
+        print(f"[team] aggregated mode: {len(project_ids)} проектов параллельно", flush=True)
         multi = MultiProjectAnalytics(project_ids=project_ids)
         report = await multi.generate_aggregated_report(days=days)
         project_name = "All Projects"
         all_mrs = report['merge_requests']['list']
         commits_by_author = report['commits']['by_author']
+    print(f"[team] отчёт собран за {int((time.perf_counter() - t) * 1000)}мс (MR={len(all_mrs)}, авторов={len(commits_by_author)})", flush=True)
     
     # Ищем данные автора по коммитам
     author_stats = None
@@ -163,6 +169,7 @@ async def get_full_report(
             state=mr['state'],
             web_url=mr['web_url'],
             created_at=mr['created_at'],
+            updated_at=mr.get('updated_at'),
             merged_at=mr.get('merged_at'),
             time_to_merge_hours=mr.get('time_to_merge_hours'),
             commits_count=mr.get('commits_count', 0),
@@ -172,6 +179,11 @@ async def get_full_report(
             actual_author_username=mr.get('actual_author_username'),
             merged_by=mr.get('merged_by'),
             merged_by_username=mr.get('merged_by_username'),
+            size_bucket=mr.get('size_bucket'),
+            is_stale=mr.get('is_stale', False),
+            changed_files_count=mr.get('changed_files_count', 0),
+            test_files_count=mr.get('test_files_count', 0),
+            has_tests=mr.get('has_tests', False),
             quality_score=MRQualityScore(
                 signals=MRQualitySignals(
                     small_size=signals_raw.get('small_size', False),
@@ -228,19 +240,94 @@ async def get_full_report(
 
     commit_messages = report['commits'].get('commit_messages', {}).get(matched_author_name, [])
     analyzer = SimpleAnalyzer()
-    conventional_count = 0
-    for msg in commit_messages:
-        result = analyzer.check_conventional_commit(msg)
-        if result.get('is_conventional'):
-            conventional_count += 1
-    conventional_ratio = int(conventional_count / len(commit_messages) * 100) if commit_messages else 0
-    conversation_prompt = analyzer.generate_summary(
-        author=target_username,
-        ratio=conventional_ratio,
-        total_commits=commits_count,
-        conventional_count=conventional_count
+
+    t = time.perf_counter()
+    conventional_count = sum(
+        1 for msg in commit_messages if analyzer.check_conventional_commit(msg)['is_conventional']
     )
-    
+    conventional_ratio = int(conventional_count / len(commit_messages) * 100) if commit_messages else 0
+    print(
+        f"[team] conventional-check (regex): {conventional_count}/{len(commit_messages)} "
+        f"({conventional_ratio}%) за {int((time.perf_counter() - t) * 1000)}мс",
+        flush=True,
+    )
+
+    conversation_prompt = await analyzer.generate_quality_summary(
+        author=target_username,
+        commit_messages=commit_messages,
+        conventional_ratio=conventional_ratio,
+        conventional_count=conventional_count,
+    )
+
+    # Персональные срезы из глобальных агрегатов
+    global_review = report.get('review_activity', {}) or {}
+    global_review_graph = global_review.get('graph', {}) or {}
+    global_given_by = global_review.get('given_by', {}) or {}
+    global_received_by = global_review.get('received_by', {}) or {}
+    global_wip = report.get('wip_stale', {}) or {}
+
+    def _author_matches(name: str) -> bool:
+        return user_mapper.normalize_author(name).lower() == target_username.lower()
+
+    # Кого ревьюит этот разработчик (reviewer = dev → author: count)
+    reviews_given_to: Dict[str, int] = {}
+    for reviewer, authors_counts in global_review_graph.items():
+        if _author_matches(reviewer):
+            for author_name, count in authors_counts.items():
+                reviews_given_to[author_name] = reviews_given_to.get(author_name, 0) + count
+
+    # Кто ревьюит этого разработчика (reviewer: count on dev's MRs)
+    reviews_received_from: Dict[str, int] = {}
+    for reviewer, authors_counts in global_review_graph.items():
+        for author_name, count in authors_counts.items():
+            if _author_matches(author_name):
+                reviews_received_from[reviewer] = reviews_received_from.get(reviewer, 0) + count
+
+    total_reviews_given = sum(
+        v for k, v in global_given_by.items() if _author_matches(k)
+    )
+    total_reviews_received = sum(
+        v for k, v in global_received_by.items() if _author_matches(k)
+    )
+
+    # Размеры MR разработчика
+    size_distribution = {"XS": 0, "S": 0, "M": 0, "L": 0, "XL": 0}
+    for mr in author_mrs:
+        b = mr.get('size_bucket') or 'M'
+        size_distribution[b] = size_distribution.get(b, 0) + 1
+
+    # Тесты
+    mrs_with_tests = sum(1 for mr in author_mrs if mr.get('has_tests'))
+    tests_ratio = (mrs_with_tests / total_mrs) if total_mrs else 0.0
+
+    # WIP / Stale для этого разработчика
+    wip_count = sum(v for k, v in (global_wip.get('wip_by_author') or {}).items() if _author_matches(k))
+    stale_count = sum(v for k, v in (global_wip.get('stale_by_author') or {}).items() if _author_matches(k))
+
+    team_metrics = {
+        "size_distribution": size_distribution,
+        "tests": {
+            "mrs_with_tests": mrs_with_tests,
+            "total_mrs": total_mrs,
+            "ratio": tests_ratio,
+        },
+        "wip_stale": {
+            "wip": wip_count,
+            "stale": stale_count,
+            "stale_threshold_days": global_wip.get('stale_threshold_days', 7),
+        },
+        "reviews_given": {
+            "total": total_reviews_given,
+            "by_author": reviews_given_to,
+        },
+        "reviews_received": {
+            "total": total_reviews_received,
+            "by_reviewer": reviews_received_from,
+        },
+    }
+
+    print(f"[team] /report username={username!r} — ГОТОВО за {int((time.perf_counter() - t_total) * 1000)}мс", flush=True)
+
     return DeveloperReportResponse(
         developer=target_username,
         period_days=days,
@@ -272,5 +359,6 @@ async def get_full_report(
             'by_author': by_author,
             'per_mr_avg': total_comments / total_mrs if total_mrs > 0 else 0
         },
-        conversation_prompt=conversation_prompt
+        conversation_prompt=conversation_prompt,
+        team_metrics=team_metrics,
     )

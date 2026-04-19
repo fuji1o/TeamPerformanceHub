@@ -188,12 +188,12 @@ function renderSignals(report, username) {
 
 function renderMRTable(mrs) {
     const tbody = document.getElementById("mrTableBody");
-    
+
     if (!mrs || !mrs.length) {
-        tbody.innerHTML = `<tr><td colspan="6" class="empty-row">Нет Merge Requests за период</td></td>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="empty-row">Нет Merge Requests за период</td></tr>`;
         return;
     }
-    
+
     tbody.innerHTML = mrs.map(mr => {
         const d = mr.quality_score?.details ?? {};
         const commitsCount = mr.commits_count ?? 0;
@@ -203,11 +203,17 @@ function renderMRTable(mrs) {
         const actualAuthor = mr.actual_author || mr.author || '';
         const mergedBy = mr.merged_by || '';
         const projectInfo = mr.project_name ? ` | 📁 ${escHtml(mr.project_name)}` : '';
-        
+        const sizeBucket = mr.size_bucket || '—';
+        const sizeClass = `size-${sizeBucket.toLowerCase()}`;
+        const totalChanges = (mr.total_additions || 0) + (mr.total_deletions || 0);
+        const testsIcon = mr.has_tests ? '✅' : '—';
+        const testsClass = mr.has_tests ? 'yn-yes' : 'yn-neutral';
+        const staleBadge = mr.is_stale ? ' <span class="stale-badge" title="Не обновлялся >7 дней">🕸 stale</span>' : '';
+
         return `
         <tr>
             <td>
-                <a href="${mr.web_url}" target="_blank" class="mr-link">!${mr.iid}</a>
+                <a href="${mr.web_url}" target="_blank" class="mr-link">!${mr.iid}</a>${staleBadge}
                 <span class="mr-title-sub">${escHtml(mr.title)}</span>
                 <span class="mr-title-sub" style="font-size: 0.65rem; color: #888; display: block;">
                     ✍️ ${escHtml(actualAuthor)}
@@ -216,11 +222,191 @@ function renderMRTable(mrs) {
                 </span>
             </td>
             <td>${stateBadge(mr.state)}</td>
+            <td><span class="size-badge ${sizeClass}" title="${totalChanges} строк изменено">${sizeBucket}</span></td>
+            <td><span class="yn ${testsClass}" title="${mr.test_files_count || 0} тестовых файлов из ${mr.changed_files_count || 0}">${testsIcon}</span></td>
             <td><span class="yn ${descClass}">${descIcon}</span></td>
             <td>${commitsCount}</td>
             <td>${mr.time_to_merge_hours != null ? formatHours(mr.time_to_merge_hours) : "—"}</td>
         </tr>`;
     }).join('');
+}
+
+/* ═══════════════════════════════════════════
+   TEAM METRICS: size, WIP/Stale, tests
+   ═══════════════════════════════════════════ */
+function renderTeamMetrics(report) {
+    const grid = document.getElementById("teamMetricsGrid");
+    const title = document.getElementById("teamMetricsTitle");
+    if (!grid) return;
+
+    const m = report.team_metrics || {};
+    const sizeDist = m.size_distribution || {};
+    const wip = m.wip_stale || {};
+    const tests = m.tests || {};
+
+    if (title) title.style.display = '';
+    grid.style.display = '';
+
+    const totalMRs = Object.values(sizeDist).reduce((a, b) => a + b, 0);
+    const sizeBars = ['XS', 'S', 'M', 'L', 'XL'].map(b => {
+        const count = sizeDist[b] || 0;
+        const pct = totalMRs ? (count / totalMRs) * 100 : 0;
+        return `
+          <div class="size-row">
+            <span class="size-label size-${b.toLowerCase()}">${b}</span>
+            <div class="size-bar-wrap">
+              <div class="size-bar size-bar-${b.toLowerCase()}" style="width:${pct}%"></div>
+            </div>
+            <span class="size-count">${count}</span>
+          </div>`;
+    }).join('');
+
+    const testsPct = tests.total_mrs ? Math.round((tests.ratio || 0) * 100) : 0;
+    let testsStatus = 'neutral';
+    if (tests.total_mrs > 0) {
+        if (testsPct >= 50) testsStatus = 'good';
+        else if (testsPct >= 20) testsStatus = 'warning';
+        else testsStatus = 'bad';
+    }
+
+    let wipStatus = 'good';
+    if ((wip.stale || 0) > 0) wipStatus = 'bad';
+    else if ((wip.wip || 0) > 3) wipStatus = 'warning';
+
+    grid.innerHTML = `
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">📏 Размер MR</span>
+          <span class="metric-sub">${totalMRs} MR всего</span>
+        </div>
+        ${totalMRs ? sizeBars : '<p class="metric-empty">Нет MR за период</p>'}
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">🚧 WIP / Stale</span>
+          <span class="signal-badge" data-status="${wipStatus}">${wip.wip || 0} открыто</span>
+        </div>
+        <div class="wip-stats">
+          <div class="wip-line"><b>${wip.wip || 0}</b> <span>открытых MR</span></div>
+          <div class="wip-line ${(wip.stale || 0) > 0 ? 'wip-warn' : ''}">
+            <b>${wip.stale || 0}</b>
+            <span>не обновлялись >${wip.stale_threshold_days || 7} дней</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">🧪 Тесты в MR</span>
+          <span class="signal-badge" data-status="${testsStatus}">${testsPct}%</span>
+        </div>
+        <div class="tests-stats">
+          <div class="tests-line"><b>${tests.mrs_with_tests || 0}</b> из <b>${tests.total_mrs || 0}</b> MR затрагивают тесты</div>
+          <div class="tests-hint">Доля MR с изменениями в test-файлах</div>
+        </div>
+      </div>
+    `;
+}
+
+function renderOverviewReviewActivity(reviewActivity) {
+    const container = document.getElementById("reviewGrid");
+    if (!container) return;
+
+    const givenBy = reviewActivity.given_by || {};
+    const receivedBy = reviewActivity.received_by || {};
+
+    const topN = (obj, n = 10) =>
+        Object.entries(obj || {})
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, n);
+
+    const totalGiven = Object.values(givenBy).reduce((a, b) => a + b, 0);
+    const totalReceived = Object.values(receivedBy).reduce((a, b) => a + b, 0);
+
+    const renderList = (entries, emptyMsg) => {
+        if (!entries.length) return `<p class="metric-empty">${emptyMsg}</p>`;
+        const max = entries[0][1] || 1;
+        return entries.map(([name, count]) => {
+            const pct = (count / max) * 100;
+            return `
+              <div class="review-row">
+                <span class="review-name">${escHtml(name)}</span>
+                <div class="review-bar-wrap">
+                  <div class="review-bar" style="width:${pct}%"></div>
+                </div>
+                <span class="review-count">${count}</span>
+              </div>`;
+        }).join('');
+    };
+
+    container.style.display = '';
+    container.innerHTML = `
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">👁 Топ ревьюеров (кто даёт ревью)</span>
+          <span class="metric-sub">${totalGiven} комментариев всего</span>
+        </div>
+        ${renderList(topN(givenBy), 'Нет ревью-активности')}
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">📥 Кто получает больше всего ревью</span>
+          <span class="metric-sub">${totalReceived} комментариев всего</span>
+        </div>
+        ${renderList(topN(receivedBy), 'Нет ревью-активности')}
+      </div>
+    `;
+}
+
+function renderReviewPartners(report) {
+    const container = document.getElementById("reviewGrid");
+    if (!container) return;
+
+    const m = report.team_metrics || {};
+    const given = m.reviews_given || { total: 0, by_author: {} };
+    const received = m.reviews_received || { total: 0, by_reviewer: {} };
+
+    const topN = (obj, n = 8) =>
+        Object.entries(obj || {})
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, n);
+
+    const renderList = (entries, emptyMsg) => {
+        if (!entries.length) return `<p class="metric-empty">${emptyMsg}</p>`;
+        const max = entries[0][1] || 1;
+        return entries.map(([name, count]) => {
+            const pct = (count / max) * 100;
+            return `
+              <div class="review-row">
+                <span class="review-name">${escHtml(name)}</span>
+                <div class="review-bar-wrap">
+                  <div class="review-bar" style="width:${pct}%"></div>
+                </div>
+                <span class="review-count">${count}</span>
+              </div>`;
+        }).join('');
+    };
+
+    container.style.display = '';
+    container.innerHTML = `
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">👁 Кто ревьюит этого разработчика</span>
+          <span class="metric-sub">${received.total || 0} комментариев</span>
+        </div>
+        ${renderList(topN(received.by_reviewer), 'Никто не ревьюил MR разработчика в этом периоде')}
+      </div>
+
+      <div class="metric-card">
+        <div class="metric-head">
+          <span class="metric-title">✍️ Кого ревьюит этот разработчик</span>
+          <span class="metric-sub">${given.total || 0} комментариев</span>
+        </div>
+        ${renderList(topN(given.by_author), 'Разработчик не оставлял комментариев к чужим MR')}
+      </div>
+    `;
 }
 
 function renderCommentTypes(mrs) {
@@ -557,19 +743,43 @@ async function loadOverview(days, projectId = null) {
             signalsGrid.innerHTML = '<div class="signal-card">Нет данных за период</div>';
         }
         
+        // Командные метрики в режиме overview — сворачиваем словари в суммы
+        const wipRaw = data.wip_stale || {};
+        const wipTotal = Object.values(wipRaw.wip_by_author || {}).reduce((a, b) => a + b, 0);
+        const staleTotal = Object.values(wipRaw.stale_by_author || {}).reduce((a, b) => a + b, 0);
+
+        renderTeamMetrics({
+            team_metrics: {
+                size_distribution: data.size_distribution || {},
+                wip_stale: {
+                    wip: wipTotal,
+                    stale: staleTotal,
+                    stale_threshold_days: wipRaw.stale_threshold_days || 7,
+                },
+                tests: {
+                    mrs_with_tests: (data.tests_ratio || {}).mrs_with_tests || 0,
+                    total_mrs: (data.tests_ratio || {}).total_mrs || 0,
+                    ratio: (data.tests_ratio || {}).ratio || 0,
+                },
+            }
+        });
+
+        // Топ ревьюеров / топ получателей ревью
+        renderOverviewReviewActivity(data.review_activity || {});
+
         // Показываем список MR
         const mrTableBody = document.getElementById("mrTableBody");
         const mrsList = data.merge_requests?.list || [];
-        
+
         if (mrsList.length) {
             renderMRTable(mrsList);
         } else {
-            mrTableBody.innerHTML = `<tr><td colspan="6" class="empty-row">Нет Merge Requests за период</td></tr>`;
+            mrTableBody.innerHTML = `<tr><td colspan="7" class="empty-row">Нет Merge Requests за период</td></tr>`;
         }
-        
+
         // Показываем типы комментариев
         renderCommentTypes(mrsList);
-        
+
         dashboard.classList.remove("hidden");
     } catch (e) {
         console.error("loadOverview:", e);
@@ -654,6 +864,12 @@ async function loadDeveloperReport(username, days, projectId = null) {
         
         // Prompt - используем report с conversation_prompt от LLM
         renderPrompt(report);
+
+        // Team metrics (size, WIP/Stale, tests)
+        renderTeamMetrics(report);
+
+        // Review partners
+        renderReviewPartners(report);
 
         // MR Table
         renderMRTable(mrs);

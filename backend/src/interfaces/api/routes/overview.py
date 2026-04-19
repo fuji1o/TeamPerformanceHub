@@ -96,4 +96,8 @@ async def get_overview(
             "list": mrs_list
         },
         "projects_breakdown": projects_info,
+        "review_activity": report.get('review_activity', {}),
+        "size_distribution": report.get('size_distribution', {}),
+        "tests_ratio": report.get('tests_ratio', {}),
+        "wip_stale": report.get('wip_stale', {}),
     }

@@ -53,6 +53,7 @@ class MRItem(BaseModel):
     state: str
     web_url: str
     created_at: str
+    updated_at: Optional[str] = None
     merged_at: Optional[str] = None
     time_to_merge_hours: Optional[float] = None
     commits_count: int = 0
@@ -66,6 +67,11 @@ class MRItem(BaseModel):
     comment_stats: Dict[str, Any]
     project_id: Optional[int] = None
     project_name: Optional[str] = None
+    size_bucket: Optional[str] = None
+    is_stale: bool = False
+    changed_files_count: int = 0
+    test_files_count: int = 0
+    has_tests: bool = False
 
 
 class DeveloperReportResponse(BaseModel):
@@ -80,3 +86,4 @@ class DeveloperReportResponse(BaseModel):
     mr_stats: Dict[str, Any]
     comments: Dict[str, Any]
     conversation_prompt: str
+    team_metrics: Dict[str, Any] = {}
